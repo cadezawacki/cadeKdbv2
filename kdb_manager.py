@@ -24,7 +24,10 @@ Architecture::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
+import logging
+import threading
 import time
 from collections import OrderedDict, UserList
 from collections.abc import Sequence
@@ -39,6 +42,12 @@ from kdb_client import CadeKdb, CadeKdbPoolConfig, CadeKdbTransformConfig
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+_log = logging.getLogger(__name__)
+
+# Hard bound on a single metrics probe during the maintenance sweep.  A
+# stalled Rust-side call must never freeze the eviction loop.
+_METRICS_TIMEOUT_S = 1.0
 
 __all__ = [
     "CadeKdbManager",
@@ -181,12 +190,13 @@ def fconn(
     """
     config = config if isinstance(config, list) else [config]
     full_args = _interweave_lists(config, *args) if weave else config + list(args)
-    passes_filters = full_args.copy()
-    for c in full_args:
-        for k, v in kwargs.items():
-            if not _check_condition(c, k, v, strict):
-                passes_filters.remove(c)
-                break
+    # List-comprehension filter avoids the O(n*m) .remove() path and, more
+    # importantly, the value-equality bug where two equal-but-distinct
+    # config dicts cause the wrong entry to be removed.
+    passes_filters = [
+        c for c in full_args
+        if all(_check_condition(c, k, v, strict) for k, v in kwargs.items())
+    ]
     return ConnectionList(passes_filters)
 
 
@@ -294,32 +304,42 @@ def _resolve_hosts(
 
 
 class AuthCache:
-    """LRU-bounded cache of successful (host, port) -> (user, password) mappings."""
+    """LRU-bounded cache of successful (host, port) -> (user, password) mappings.
 
-    __slots__ = ("_cache", "_maxsize")
+    Uses an explicit ``threading.Lock`` so that concurrent reads/writes are
+    safe under free-threaded / no-GIL CPython builds, not just relying on
+    the implicit atomicity of individual ``OrderedDict`` ops under the GIL.
+    """
+
+    __slots__ = ("_cache", "_maxsize", "_lock")
 
     def __init__(self, maxsize: int = 1024) -> None:
         self._cache: OrderedDict[tuple[str, int], tuple[str, str]] = OrderedDict()
         self._maxsize = maxsize
+        self._lock = threading.Lock()
 
     def get(self, host: str, port: int) -> tuple[str, str] | None:
-        pair = self._cache.get((host, port))
-        if pair is not None:
-            self._cache.move_to_end((host, port))
-        return pair
+        with self._lock:
+            pair = self._cache.get((host, port))
+            if pair is not None:
+                self._cache.move_to_end((host, port))
+            return pair
 
     def remember(self, host: str, port: int, user: str, password: str) -> None:
         key = (host, port)
-        self._cache[key] = (user, password)
-        self._cache.move_to_end(key)
-        if len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
+        with self._lock:
+            self._cache[key] = (user, password)
+            self._cache.move_to_end(key)
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
 
     def forget(self, host: str, port: int) -> None:
-        self._cache.pop((host, port), None)
+        with self._lock:
+            self._cache.pop((host, port), None)
 
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -571,17 +591,19 @@ class CadeKdbManager:
         if stale is not None:
             try:
                 await asyncio.wait_for(stale.close(), timeout=2.0)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                pass
+                _log.exception(
+                    "stale pool close failed for %s:%s", host, port
+                )
 
         # Connect outside lock — slow I/O won't block other hosts.
         try:
             await client.connect()
-        except Exception:
-            try:
+        except BaseException:
+            with contextlib.suppress(Exception):
                 await client.close()
-            except Exception:
-                pass
             raise
 
         # Commit under lock — handle race with concurrent get_or_create().
@@ -589,10 +611,8 @@ class CadeKdbManager:
             race_winner = self._pools.get(key)
             if race_winner is not None and race_winner.connected:
                 # Lost the race — discard ours.
-                try:
+                with contextlib.suppress(Exception):
                     await client.close()
-                except Exception:
-                    pass
                 return race_winner
             self._pools[key] = client
             return client
@@ -607,8 +627,10 @@ class CadeKdbManager:
         if client is not None:
             try:
                 await asyncio.wait_for(client.close(), timeout=5.0)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                pass
+                _log.exception("pool close failed for %s", key)
 
     # -- Maintenance -------------------------------------------------------
 
@@ -624,42 +646,60 @@ class CadeKdbManager:
 
             try:
                 await self._trim_idle_pools()
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                pass
+                # Surface maintenance-sweep failures instead of swallowing
+                # them silently — operators need this signal to diagnose
+                # broken pool state in production.
+                _log.exception("kdb manager maintenance sweep failed")
 
     async def _trim_idle_pools(self) -> None:
-        """Remove pools that have zero connections and no recent activity."""
+        """Remove pools that have zero connections and no recent activity.
+
+        Captures the *scanned* client reference in the candidate list and
+        re-checks identity under the lock before eviction.  The previous
+        implementation compared ``self._pools.get(key)`` to itself, which
+        is trivially ``True`` and allowed the sweep to close brand-new
+        pools that had replaced stale ones between scan and trim.
+        """
         now = time.monotonic()
         idle_cutoff = now - self._default_pool_config.idle_timeout_ms / 1000.0
-        to_remove: list[str] = []
+        candidates: list[tuple[str, CadeKdb]] = []
 
         for key, client in list(self._pools.items()):
             if not client.connected:
-                to_remove.append(key)
+                candidates.append((key, client))
                 continue
             try:
-                m = await client.metrics()
-                if m.connections == 0 and client.last_success_time < idle_cutoff:
-                    to_remove.append(key)
+                m = await asyncio.wait_for(
+                    client.metrics(), timeout=_METRICS_TIMEOUT_S,
+                )
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                to_remove.append(key)
+                # Hung / errored pool — treat as eviction candidate so we
+                # reclaim it instead of stalling the maintenance loop.
+                candidates.append((key, client))
+                continue
+            if m.connections == 0 and client.last_activity_time < idle_cutoff:
+                candidates.append((key, client))
 
-        for key in to_remove:
+        for key, scanned in candidates:
+            victim: CadeKdb | None = None
             async with self._lock:
-                # Re-validate: only pop if it's still the same object we scanned.
+                # True identity comparison: only evict if the dict still
+                # points to the same object we scanned.
                 current = self._pools.get(key)
-                if current is not None and (
-                    not current.connected
-                    or current is self._pools.get(key)  # same ref
-                ):
-                    client = self._pools.pop(key, None)
-                else:
-                    client = None
-            if client is not None:
+                if current is scanned:
+                    victim = self._pools.pop(key, None)
+            if victim is not None:
                 try:
-                    await asyncio.wait_for(client.close(), timeout=2.0)
+                    await asyncio.wait_for(victim.close(), timeout=2.0)
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
-                    pass
+                    _log.exception("kdb pool close failed for %s", key)
 
     # -- Single-host attempt -----------------------------------------------
 
@@ -676,18 +716,29 @@ class CadeKdbManager:
     ) -> Union[pl.LazyFrame, pl.DataFrame, q.Value]:
         """Try *expr* on a single host, rotating through *creds* on auth failure.
 
+        All credential attempts share a single deadline so total wall-clock
+        cannot exceed *timeout*.  Without this, N credentials × M hosts ×
+        timeout can silently blow the caller's budget.
+
         On auth failure the pool is evicted so the next credential creates a
         fresh pool with the new user/password.
         """
+        deadline = time.monotonic() + timeout
         last_exc: BaseException | None = None
 
         for user, password in creds:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise last_exc or TimeoutError(
+                    f"Credential rotation deadline exceeded for "
+                    f"{hc.host}:{hc.port}"
+                )
             try:
                 # Bound pool creation by the remaining query timeout so that
                 # a slow connect() can't silently blow the deadline.
                 conn_ms = min(
                     self._connection_timeout_ms,
-                    max(int(timeout * 1000), 500),
+                    max(int(remaining * 1000), 500),
                 )
                 client = await self.get_or_create(
                     hc.host,
@@ -699,7 +750,7 @@ class CadeKdbManager:
                 )
                 result = await client.query(
                     expr,
-                    timeout=timeout,
+                    timeout=remaining,
                     output=output,
                     transform=transform,
                     decode=decode,
@@ -827,26 +878,38 @@ class CadeKdbManager:
                         continue
                     try:
                         result = t.result()
-                        for p in pending:
-                            p.cancel()
-                        if pending:
-                            await asyncio.gather(
-                                *pending, return_exceptions=True
-                            )
-                        return result
                     except q.QRuntimeError:
                         for p in pending:
                             p.cancel()
                         if pending:
-                            await asyncio.gather(
-                                *pending, return_exceptions=True
+                            # Shield cleanup so an outer wait_for cannot
+                            # leave tasks orphaned.
+                            await asyncio.shield(
+                                asyncio.gather(
+                                    *pending, return_exceptions=True
+                                )
                             )
                         raise
                     except Exception as e:
                         errors[label] = e
+                    else:
+                        for p in pending:
+                            p.cancel()
+                        if pending:
+                            # SHIELD the drain: without this, if the outer
+                            # asyncio.wait_for deadline expires while we're
+                            # waiting for cancelled siblings to finish, the
+                            # successfully-obtained result is LOST and the
+                            # caller sees a spurious TimeoutError.
+                            await asyncio.shield(
+                                asyncio.gather(
+                                    *pending, return_exceptions=True
+                                )
+                            )
+                        return result
 
             if errors:
-                raise next(reversed(errors.values()))
+                raise next(iter(errors.values()))
             raise RuntimeError("Aggressive fan-out: all hosts failed.")
 
         try:
@@ -860,12 +923,25 @@ class CadeKdbManager:
                 if not t.done():
                     t.cancel()
             # Shield the cleanup gather so an external CancelledError
-            # cannot interrupt it and orphan running tasks.
+            # cannot interrupt it and orphan running tasks.  Bound the
+            # wait so a task stuck in a non-cooperative Rust call cannot
+            # hang the caller forever — if it misses the deadline we let
+            # the tasks run to completion in the background.
             pending = [t for t in tasks if not t.done()]
             if pending:
-                await asyncio.shield(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
+                drain = asyncio.gather(*pending, return_exceptions=True)
+                try:
+                    await asyncio.shield(
+                        asyncio.wait_for(drain, timeout=2.0)
+                    )
+                except asyncio.TimeoutError:
+                    _log.warning(
+                        "aggressive fan-out: %d task(s) did not cancel "
+                        "within 2s; leaving in background",
+                        len(pending),
+                    )
+                except Exception:
+                    pass
 
     # -- Backdoor routing (Feature 11) -------------------------------------
 
@@ -877,10 +953,30 @@ class CadeKdbManager:
         user: str,
         password: str,
     ) -> str:
-        """Wrap *expr* to execute via IPC proxy through a backdoor host."""
-        escaped = expr.replace('"', '\\"')
+        """Wrap *expr* to execute via IPC proxy through a backdoor host.
+
+        Rejects credentials/hosts containing characters that would corrupt
+        the q IPC address grammar (``:``) or the outer string literal
+        (``"``, ``\\``, CR/LF/TAB).  Without these checks a password
+        containing ``"`` becomes a remote code execution primitive on the
+        intermediary.  The expression itself has BOTH backslash and quote
+        escaped — the previous implementation only escaped quotes, allowing
+        an attacker-controlled ``\\"`` to pivot-escape.
+        """
+        _forbidden = ':"\\\n\r\t'
+        for field, val in (
+            ("user", user),
+            ("password", password),
+            ("host", target_host),
+        ):
+            if val is None or any(c in val for c in _forbidden):
+                raise ValueError(
+                    f"Unsafe character in backdoor {field}; refusing to build"
+                )
+        escaped = expr.replace("\\", "\\\\").replace('"', '\\"')
         return (
-            f'(`$":{target_host}:{target_port}:{user}:{password}")"{escaped}"'
+            f'(`$":{target_host}:{target_port}:{user}:{password}")'
+            f'"{escaped}"'
         )
 
     async def _backdoor_query(
@@ -1085,9 +1181,19 @@ class CadeKdbManager:
             raise RuntimeError("Query returned None (none_is_failure=True).")
 
         if empty_is_failure and isinstance(result, (pl.DataFrame, pl.LazyFrame)):
-            df = result.collect() if isinstance(result, pl.LazyFrame) else result
-            if df.is_empty():
-                raise RuntimeError("Query returned empty result (empty_is_failure=True).")
+            if isinstance(result, pl.LazyFrame):
+                # Probe with .limit(1).collect() instead of materializing
+                # the whole lazy pipeline — a full .collect() just to check
+                # emptiness defeats the zero-copy lazy optimization and on
+                # multi-GB result sets causes OOM under concurrent queries.
+                probe = result.limit(1).collect()
+                is_empty = probe.is_empty()
+            else:
+                is_empty = result.is_empty()
+            if is_empty:
+                raise RuntimeError(
+                    "Query returned empty result (empty_is_failure=True)."
+                )
 
         return result
 
@@ -1191,18 +1297,26 @@ class CadeKdbManager:
     # -- Diagnostics -------------------------------------------------------
 
     async def pool_stats(self) -> dict[str, dict[str, Any]]:
-        """Return metrics for all managed pools."""
+        """Return metrics for all managed pools.
+
+        Each per-pool metrics call is bounded so that a single hung pool
+        cannot freeze the entire diagnostics call.
+        """
         stats: dict[str, dict[str, Any]] = {}
         for key, client in list(self._pools.items()):
             try:
                 if client.connected:
-                    m = await client.metrics()
+                    m = await asyncio.wait_for(
+                        client.metrics(), timeout=_METRICS_TIMEOUT_S,
+                    )
                     stats[key] = {
                         "connections": m.connections,
                         "idle": m.idle_connections,
                         "max_size": m.max_size,
                         "last_success": client.last_success_time,
                     }
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 stats[key] = {"status": "error"}
         return stats
@@ -1247,7 +1361,7 @@ def _norm_arg_names(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 async def query_kdb(
-    q: str | None = None,
+    expr: str | None = None,
     *,
     manager: CadeKdbManager,
     config: ConnectionList | Sequence[dict[str, Any]] | dict[str, Any] | None = None,
@@ -1281,10 +1395,15 @@ async def query_kdb(
     accepts the same argument names and conventions as the legacy
     ``query_kdb()`` function.
 
+    The primary parameter name is ``expr``; the legacy ``q=`` kwarg alias
+    is still accepted for backwards compatibility.  (Renamed so the function
+    body no longer shadows the ``qroissant`` module import.)
+
     Parameters
     ----------
-    q : str
-        q expression to evaluate (positional, like the old API).
+    expr : str
+        q expression to evaluate (positional, like the old API).  Legacy
+        callers may pass ``q=`` as a keyword alias.
     manager : CadeKdbManager
         **Required.**  The pool manager to route through.
         Legacy alias ``_kdb`` is also accepted.
@@ -1303,11 +1422,13 @@ async def query_kdb(
     lazy : bool
         If ``True`` (default), return a LazyFrame.
     """
-    # Normalise legacy aliases.
+    # Normalise legacy aliases.  Accept ``q=`` as a positional-equivalent
+    # kwarg so existing callers keep working.
     mgr = _kdb or manager
-    expr = q
+    if expr is None and "q" in kwargs:
+        expr = kwargs.pop("q")
     if expr is None:
-        raise ValueError("Query expression (q) is required.")
+        raise ValueError("Query expression is required (pass as positional or expr=).")
 
     normalized = _norm_arg_names({
         "usr": usr, "user": user, "username": username,
