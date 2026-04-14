@@ -435,6 +435,7 @@ class CadeKdbManager:
         "_pools",
         "_lock",
         "_key_locks",
+        "_key_lock_refcount",
         "_auth_cache",
         "_credentials",
         "_default_pool_config",
@@ -464,7 +465,17 @@ class CadeKdbManager:
         # cycle in parallel before the commit-lock deduplicates — a
         # reconnect storm that CadeKdb goes to lengths to prevent per-instance
         # but the manager previously re-introduced at the registry level.
+        #
+        # Refcounted cleanup: each ``get_or_create`` increments
+        # ``_key_lock_refcount[key]`` under ``_lock`` and decrements in a
+        # ``finally``; when the count reaches zero the entry is removed.
+        # This is safe because both lookup and decrement happen under
+        # ``_lock`` — no task can fetch a key-lock that is about to be
+        # deleted (the deletion only fires when no task holds a reference).
+        # Previously ``_key_locks`` grew monotonically, leaking one Lock
+        # per unique ``host:port[:name]`` for the lifetime of the manager.
         self._key_locks: dict[str, asyncio.Lock] = {}
+        self._key_lock_refcount: dict[str, int] = {}
         self._auth_cache = AuthCache()
         self._credentials: list[tuple[str, str]] = list(credentials or _DEFAULT_CREDS)
         self._default_pool_config = pool_config or CadeKdbPoolConfig()
@@ -509,6 +520,12 @@ class CadeKdbManager:
             for client in self._pools.values():
                 close_tasks.append(asyncio.create_task(client.close()))
             self._pools.clear()
+            # Drop any remaining key-lock entries.  After ``shutdown`` no
+            # new ``get_or_create`` calls should run; any in-flight caller
+            # still holds its own lock reference and will observe a closed
+            # pool on the next attempt.
+            self._key_locks.clear()
+            self._key_lock_refcount.clear()
         if close_tasks:
             try:
                 await asyncio.wait_for(
@@ -575,75 +592,91 @@ class CadeKdbManager:
             return existing
 
         # Obtain (or lazily create) the per-key creation lock under the
-        # global lock.  The per-key lock itself is only held for the
-        # duration of one creation attempt.
+        # global lock and bump its refcount so it cannot be reclaimed
+        # by another task's cleanup while we still hold a reference.
         async with self._lock:
             key_lock = self._key_locks.get(key)
             if key_lock is None:
                 key_lock = asyncio.Lock()
                 self._key_locks[key] = key_lock
+            self._key_lock_refcount[key] = (
+                self._key_lock_refcount.get(key, 0) + 1
+            )
 
-        async with key_lock:
-            # Re-check under the per-key lock — another task may have
-            # just completed creation.
-            existing = self._pools.get(key)
-            if existing is not None and existing.connected:
-                return existing
+        try:
+            async with key_lock:
+                # Re-check under the per-key lock — another task may have
+                # just completed creation.
+                existing = self._pools.get(key)
+                if existing is not None and existing.connected:
+                    return existing
 
-            # Resolve credentials and construct client under the global
-            # lock (Python-only, no I/O).
-            async with self._lock:
-                stale = self._pools.pop(key, None)
+                # Resolve credentials and construct client under the global
+                # lock (Python-only, no I/O).
+                async with self._lock:
+                    stale = self._pools.pop(key, None)
 
-                u, p = username, password
-                if u is None or p is None:
-                    cached = self._auth_cache.get(host, port)
-                    if cached:
-                        u, p = cached
-                    elif self._credentials:
-                        u, p = self._credentials[0]
+                    u, p = username, password
+                    if u is None or p is None:
+                        cached = self._auth_cache.get(host, port)
+                        if cached:
+                            u, p = cached
+                        elif self._credentials:
+                            u, p = self._credentials[0]
 
-                ct = connection_timeout_ms or self._connection_timeout_ms
-                client = CadeKdb(
-                    host=host,
-                    port=port,
-                    username=u,
-                    password=p,
-                    connection_timeout_ms=ct,
-                    query_timeout=self._query_timeout,
-                    pool=pool_config or self._default_pool_config,
-                    transform=self._default_transform,
-                )
-
-            # Best-effort close of stale entry (outside global lock, still
-            # inside per-key lock so no other task can race us here).
-            if stale is not None:
-                try:
-                    await asyncio.wait_for(stale.close(), timeout=2.0)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    _log.exception(
-                        "stale pool close failed for %s:%s", host, port
+                    ct = connection_timeout_ms or self._connection_timeout_ms
+                    client = CadeKdb(
+                        host=host,
+                        port=port,
+                        username=u,
+                        password=p,
+                        connection_timeout_ms=ct,
+                        query_timeout=self._query_timeout,
+                        pool=pool_config or self._default_pool_config,
+                        transform=self._default_transform,
                     )
 
-            # Slow connect+prewarm I/O, bounded by the caller's remaining
-            # deadline when supplied.
-            try:
-                await client.connect(connect_timeout=connect_timeout)
-            except BaseException:
-                with contextlib.suppress(Exception):
-                    await client.close()
-                raise
+                # Best-effort close of stale entry (outside global lock, still
+                # inside per-key lock so no other task can race us here).
+                if stale is not None:
+                    try:
+                        await asyncio.wait_for(stale.close(), timeout=2.0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        _log.exception(
+                            "stale pool close failed for %s:%s", host, port
+                        )
 
-            # Commit under global lock.  With the per-key lock held we are
-            # guaranteed there is no concurrent creator for this key, so
-            # the old "race winner" branch can be simplified to a direct
-            # install.
+                # Slow connect+prewarm I/O, bounded by the caller's remaining
+                # deadline when supplied.
+                try:
+                    await client.connect(connect_timeout=connect_timeout)
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                    raise
+
+                # Commit under global lock.  With the per-key lock held we are
+                # guaranteed there is no concurrent creator for this key, so
+                # the old "race winner" branch can be simplified to a direct
+                # install.
+                async with self._lock:
+                    self._pools[key] = client
+
+                return client
+        finally:
+            # Decrement the refcount and reclaim the lock entry when no
+            # other task is using it.  Both halves of the refcount
+            # protocol run under ``_lock``, so a ``get_or_create`` caller
+            # can never race us to delete a lock it just looked up.
             async with self._lock:
-                self._pools[key] = client
-
-            return client
+                count = self._key_lock_refcount.get(key, 0) - 1
+                if count <= 0:
+                    self._key_lock_refcount.pop(key, None)
+                    self._key_locks.pop(key, None)
+                else:
+                    self._key_lock_refcount[key] = count
 
     async def remove_pool(
         self, host: str, port: int, name: str | None = None
@@ -707,27 +740,51 @@ class CadeKdbManager:
         async with self._lock:
             snapshot = list(self._pools.items())
 
+        if not snapshot:
+            return
+
+        # Partition out clients that are already disconnected; they need
+        # no probe and can be evicted directly.
+        live: list[tuple[str, CadeKdb]] = []
         for key, client in snapshot:
             if not client.connected:
                 candidates.append((key, client))
-                continue
-            try:
-                m = await asyncio.wait_for(
-                    client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+            else:
+                live.append((key, client))
+
+        # Probe ALL live pools concurrently.  Sequential probing made the
+        # maintenance sweep O(N) in pool count multiplied by the per-pool
+        # timeout — with N=100 and a few hung handles, one sweep could
+        # stall ~100s, silently exceeding ``maintenance_interval`` and
+        # letting idle pools accumulate while ``idle_timeout_ms`` was
+        # apparently being honoured.
+        async def _probe(client: CadeKdb) -> q.PoolMetrics | None:
+            return await asyncio.wait_for(
+                client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
+            )
+
+        results = await asyncio.gather(
+            *(_probe(c) for _, c in live),
+            return_exceptions=True,
+        )
+
+        for (key, client), res in zip(live, results):
+            if isinstance(res, BaseException):
+                if isinstance(res, asyncio.CancelledError):
+                    raise res
                 # Hung / errored pool — treat as eviction candidate so we
                 # reclaim it instead of stalling the maintenance loop.
                 candidates.append((key, client))
                 continue
-            if m is None:
+            if res is None:
                 # Pool was nilled between the connected check and the probe.
                 # Do NOT resurrect it via auto-connect — mark for eviction.
                 candidates.append((key, client))
                 continue
-            if m.connections == 0 and client.last_activity_time < idle_cutoff:
+            if (
+                res.connections == 0
+                and client.last_activity_time < idle_cutoff
+            ):
                 candidates.append((key, client))
 
         for key, scanned in candidates:
@@ -1389,24 +1446,38 @@ class CadeKdbManager:
         # rationale (free-threaded CPython dict-mutation race).
         async with self._lock:
             snapshot = list(self._pools.items())
-        for key, client in snapshot:
-            try:
-                m = await asyncio.wait_for(
-                    client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
-                )
-                if m is None:
-                    stats[key] = {"status": "disconnected"}
-                    continue
-                stats[key] = {
-                    "connections": m.connections,
-                    "idle": m.idle_connections,
-                    "max_size": m.max_size,
-                    "last_success": client.last_success_time,
-                }
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+        if not snapshot:
+            return stats
+
+        # Probe ALL pools concurrently.  Sequential probing made the
+        # diagnostics call O(N) in pool count multiplied by the per-pool
+        # timeout — with 100 pools and a few stalled handles, a single
+        # healthcheck request would stall for >10s purely on serialization.
+        async def _probe(client: CadeKdb) -> q.PoolMetrics | None:
+            return await asyncio.wait_for(
+                client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
+            )
+
+        results = await asyncio.gather(
+            *(_probe(c) for _, c in snapshot),
+            return_exceptions=True,
+        )
+
+        for (key, client), res in zip(snapshot, results):
+            if isinstance(res, BaseException):
+                if isinstance(res, asyncio.CancelledError):
+                    raise res
                 stats[key] = {"status": "error"}
+                continue
+            if res is None:
+                stats[key] = {"status": "disconnected"}
+                continue
+            stats[key] = {
+                "connections": res.connections,
+                "idle": res.idle_connections,
+                "max_size": res.max_size,
+                "last_success": client.last_success_time,
+            }
         return stats
 
     @property

@@ -44,7 +44,11 @@ _BOOL_FALSE = ["N", "FALSE", "false"]
 _BOOL_ALL = frozenset(_BOOL_TRUE + _BOOL_FALSE)
 # Validation set includes "NA"/"" since those are nullified anyway.
 _BOOL_VALID = frozenset(_BOOL_TRUE + _BOOL_FALSE + ["NA", ""])
-_BOOL_VALID_SERIES = pl.Series("_v", list(_BOOL_VALID))  # Polars-native for is_in
+# Concrete list form for ``Expr.is_in`` — passing a Polars Series with the
+# same dtype as the column triggers a Polars >=1.39 deprecation about
+# ambiguous semantics; passing a Python list is unambiguous and stable
+# across versions.
+_BOOL_VALID_LIST = list(_BOOL_VALID)
 _STR_DTYPES = frozenset({pl.String})
 _LIST_STR_DT = pl.List(pl.String)
 
@@ -232,22 +236,34 @@ def _apply_transforms(df: pl.DataFrame, cfg: CadeKdbTransformConfig) -> pl.DataF
     # -- Detect is[A-Z]* boolean-string candidates -------------------------
     bool_candidates: set[str] = set()
     if cfg.convert_boolean_strings:
-        bool_candidates = {
+        raw_candidates = [
             c
             for c in cols
             if schema[c] in _STR_DTYPES
             and _IS_BOOL_COL_RE.match(
                 _to_camel(c) if cfg.camel_case_headers else c
             )
-        }
-        # Validate candidates: all unique non-null values must be boolean-like
-        # OR a null-equivalent ("NA", "").  Uses Polars-native is_in().all().
-        validated: set[str] = set()
-        for c in bool_candidates:
-            uniq_s = df[c].drop_nulls().unique()
-            if len(uniq_s) > 0 and uniq_s.is_in(_BOOL_VALID_SERIES).all():
-                validated.add(c)
-        bool_candidates = validated
+        ]
+        # Validate candidates: all non-null values must be boolean-like
+        # OR a null-equivalent ("NA", "").  Evaluate every column in a
+        # SINGLE ``df.select([...])`` so Polars parallelizes across
+        # columns in Rust — the previous per-column Python loop ran
+        # ``drop_nulls().unique().is_in().all()`` K times sequentially
+        # under the GIL, which dominated the transform cost for wide
+        # tables.  An empty-but-non-null check guards against an
+        # all-null column being vacuously classified as boolean.
+        if raw_candidates:
+            check_exprs = [
+                (
+                    pl.col(c).drop_nulls().is_in(_BOOL_VALID_LIST).all()
+                    & pl.col(c).is_not_null().any()
+                ).alias(c)
+                for c in raw_candidates
+            ]
+            row = df.select(check_exprs).row(0)
+            bool_candidates = {
+                c for c, ok in zip(raw_candidates, row) if ok
+            }
 
     # -- Pass 2: nullify "NA" / "" in string columns -----------------------
     #    Merge with boolean conversion for qualifying is* columns (Pass 2+3).
@@ -649,7 +665,17 @@ class CadeKdb:
                 if self._closed:
                     raise RuntimeError("Client is closed.")
                 # Reset raced with us — loop and try again.
-        raise RuntimeError("Pool unavailable after connect() retries.")
+        # Reset-storm exhaustion is a TRANSIENT condition: the
+        # circuit-breaker repeatedly evicted the pool faster than we
+        # could re-establish it.  Surface it as ``ConnectionError`` (an
+        # ``OSError`` subclass) so the manager's failover layer
+        # classifies it as transport-related and tries the next host
+        # instead of treating a transient blip as a hard programming
+        # error.  Previously this raised a bare ``RuntimeError`` which
+        # callers' classifiers would not recognize as retriable.
+        raise ConnectionError(
+            "Pool unavailable after connect() retries (reset storm)."
+        )
 
     # -- Querying ----------------------------------------------------------
 
