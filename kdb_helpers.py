@@ -72,6 +72,48 @@ def extract_table_name(s: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 _SAFE_COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_. ]*$")
+# Characters that are unsafe inside a q symbol literal — backticks, semicolons,
+# whitespace, quotes, and backslashes can all terminate or splice the symbol
+# and allow injection of arbitrary q code.
+_UNSAFE_SYM_RE = re.compile(r"[`;\s\"\\]")
+
+
+def _q_escape_str(s: str) -> str:
+    """Escape a string for safe embedding in a q string literal.
+
+    Backslash MUST be escaped before quote to avoid double-processing.
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _q_sym(s: Any) -> str:
+    """Build a q symbol literal, rejecting unsafe characters.
+
+    This is the primary defense against q-expression injection via filter
+    values.  Any character that could terminate or splice the symbol is
+    rejected outright — callers must use ``dtype="string"`` for values with
+    whitespace / quotes.
+    """
+    s = str(s)
+    if _UNSAFE_SYM_RE.search(s):
+        raise ValueError(f"Unsafe symbol value rejected: {s!r}")
+    return f"`{s}"
+
+
+def _q_number(v: Any) -> str:
+    """Serialize a number for safe q embedding.
+
+    Rejects ``bool`` (a subclass of int, but carries different semantics),
+    NaN, and infinity — all of which either misrepresent intent or produce
+    invalid q tokens.
+    """
+    if isinstance(v, bool):
+        raise ValueError(f"Boolean rejected in numeric context: {v!r}")
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        raise ValueError(f"Non-finite numeric rejected: {v!r}")
+    if not isinstance(v, (int, float)):
+        raise ValueError(f"Non-numeric rejected: {v!r}")
+    return str(v)
 
 
 def _parse_condition(col: str, condition: Any) -> str:
@@ -88,11 +130,15 @@ def _parse_condition(col: str, condition: Any) -> str:
     if condition is None:
         return f"not null {col.split(' ')[-1]}" if "not" in col else f"null {col}"
 
+    # ``bool`` MUST be checked before ``int`` — bool is a subclass of int.
+    if isinstance(condition, bool):
+        raise ValueError(f"Boolean scalar rejected: {condition!r}")
+
     if isinstance(condition, (int, float)):
-        return f"{col}={condition}"
+        return f"{col}={_q_number(condition)}"
 
     if isinstance(condition, str):
-        return f"{col}=`{condition}"
+        return f"{col}={_q_sym(condition)}"
 
     if isinstance(condition, (list, tuple, set)):
         items = _compact_seq(list(condition))
@@ -100,10 +146,11 @@ def _parse_condition(col: str, condition: Any) -> str:
             return f"{col} in ()"
 
         if all(isinstance(x, str) for x in items):
-            symbols = "`".join([""] + list(items))
+            # Each symbol validated independently — no raw interpolation.
+            symbols = "".join(_q_sym(x) for x in items)
             return f"{col} in {symbols}"
 
-        return f"{col} in ({' '.join(map(str, items))})"
+        return f"{col} in ({' '.join(_q_number(x) for x in items)})"
 
     if isinstance(condition, dict):
         value = condition.get("value")
@@ -119,44 +166,42 @@ def _parse_condition(col: str, condition: Any) -> str:
 
             if dtype == "string":
                 if len(items) == 1:
-                    escaped = str(items[0]).replace('"', '\\"')
-                    return f'{col} like "*{escaped}*"'
+                    return f'{col} like "*{_q_escape_str(str(items[0]))}*"'
                 quoted = "; ".join(
-                    f'"{str(v).replace(chr(34), chr(92) + chr(34))}"'
-                    for v in items
+                    f'"{_q_escape_str(str(v))}"' for v in items
                 )
                 return f"{col} in ({quoted})"
 
             if dtype == "string_exact":
                 if len(items) == 1:
-                    escaped = str(items[0]).replace('"', '\\"')
-                    return f'{col} like "{escaped}"'
+                    return f'{col} like "{_q_escape_str(str(items[0]))}"'
                 quoted = "; ".join(
-                    f'"{str(v).replace(chr(34), chr(92) + chr(34))}"'
-                    for v in items
+                    f'"{_q_escape_str(str(v))}"' for v in items
                 )
                 return f"{col} in ({quoted})"
 
             if dtype in ("sym", "symbol"):
-                symbols = "`".join([""] + [str(v) for v in items])
+                symbols = "".join(_q_sym(v) for v in items)
                 return f"{col} in {symbols}"
 
-            return f"{col} in ({'; '.join(map(str, items))})"
+            return f"{col} in ({'; '.join(_q_number(v) for v in items)})"
 
         # scalar dict value
         if dtype == "string":
-            escaped = str(value).replace('"', '\\"')
-            return f'{col} like "*{escaped}*"'
+            return f'{col} like "*{_q_escape_str(str(value))}*"'
         if dtype == "string_exact":
-            escaped = str(value).replace('"', '\\"')
-            return f'{col} like "{escaped}"'
+            return f'{col} like "{_q_escape_str(str(value))}"'
         if dtype in ("sym", "symbol"):
-            return f"{col}=`{value}"
+            return f"{col}={_q_sym(value)}"
         if isinstance(value, str) and dtype == "auto":
-            return f"{col}=`{value}"
-        return f"{col}={value}"
+            return f"{col}={_q_sym(value)}"
+        if isinstance(value, bool):
+            raise ValueError(f"Boolean dict value rejected: {value!r}")
+        if isinstance(value, (int, float)):
+            return f"{col}={_q_number(value)}"
+        raise ValueError(f"Unsupported dict value: {value!r}")
 
-    return f"{col}={condition}"
+    raise ValueError(f"Unsupported condition type: {type(condition).__name__}")
 
 
 def build_kdb_where(filters: list[dict[str, Any]]) -> str:
@@ -272,7 +317,8 @@ class _ColExpr:
 
 
 def _q_escape_string(s: str) -> str:
-    return '"' + s.replace('"', r"\"") + '"'
+    # Backslash MUST be escaped before quote to avoid double-processing.
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _q_symbol_list(strings: Sequence[str]) -> str:

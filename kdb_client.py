@@ -11,7 +11,9 @@ Python-side streaming + decode approach.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -24,6 +26,12 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 __all__ = ["CadeKdb", "CadeKdbPoolConfig", "CadeKdbTransformConfig"]
+
+_log = logging.getLogger(__name__)
+
+# Wall-clock bound on a single prewarm attempt so that a stalled Rust-side
+# handshake cannot freeze the connect path forever.
+_PREWARM_TIMEOUT_S = 10.0
 
 # ---------------------------------------------------------------------------
 # Pre-computed constants
@@ -180,10 +188,19 @@ def _expand_dict(d: q.Dictionary) -> pl.DataFrame:
     A naive ``pl.from_arrow(dict)`` collapses them into two struct columns
     named *keys* / *values* and loses column headers.  We detect this case
     and horizontally concatenate the key and value tables instead.
+
+    If the key and value tables share column names (e.g. both carry
+    ``date``), the value-side duplicates are dropped so that
+    ``pl.concat(..., how="horizontal")`` does not raise ``DuplicateError``.
     """
     k, v = d.keys, d.values
     if isinstance(k, q.Table) and isinstance(v, q.Table):
-        return pl.concat([pl.from_arrow(k), pl.from_arrow(v)], how="horizontal")
+        kdf = pl.from_arrow(k)
+        vdf = pl.from_arrow(v)
+        overlap = [c for c in vdf.columns if c in kdf.columns]
+        if overlap:
+            vdf = vdf.drop(overlap)
+        return pl.concat([kdf, vdf], how="horizontal")
     # Non-table dictionary: let Polars handle via PyCapsule
     result = pl.from_arrow(d)
     return result.to_frame("value") if isinstance(result, pl.Series) else result
@@ -355,10 +372,12 @@ class CadeKdb:
         "_query_timeout",
         "_closed",
         "_lock",
+        "_connect_lock",
         "_prewarm",
         "_consecutive_timeouts",
         "_max_timeouts_before_reset",
         "_last_success",
+        "_created_at",
     )
 
     def __init__(
@@ -407,81 +426,109 @@ class CadeKdb:
         self._pool: q.AsyncPool | None = None
         self._closed = False
         self._lock = asyncio.Lock()
+        # Separate lock serializes actual connect I/O so a cold-start stampede
+        # of N concurrent queries produces exactly ONE prewarm, not N.
+        self._connect_lock = asyncio.Lock()
         self._consecutive_timeouts = 0
         self._max_timeouts_before_reset = max_timeouts_before_reset
-        self._last_success = 0.0
+        # Initialize last_success to creation time.  A literal 0.0 would make
+        # every brand-new pool eligible for immediate eviction by the
+        # maintenance sweep because monotonic() >> 0.
+        now = time.monotonic()
+        self._last_success = now
+        self._created_at = now
 
     # -- Lifecycle ---------------------------------------------------------
 
     async def connect(self) -> None:
         """Initialize the connection pool (idempotent).
 
-        If ``prewarm`` is enabled, eagerly opens ``min_idle`` connections.
-        On prewarm failure the pool is closed before the error propagates.
+        If ``prewarm`` is enabled, eagerly opens ``min_idle`` connections,
+        bounded by ``_PREWARM_TIMEOUT_S`` so a stalled handshake cannot
+        freeze the connect path.
 
-        Lock is held only for the state check/commit — slow network I/O
-        (prewarm) happens outside the lock to avoid blocking concurrent
-        callers.
+        A closed client stays closed: ``connect()`` on a closed instance
+        raises ``RuntimeError`` instead of silently resurrecting — once
+        ``close()`` has been called the client is terminal.
+
+        ``_connect_lock`` serializes the slow I/O so N concurrent callers
+        on a cold client produce exactly ONE prewarm, not N (preventing
+        a reconnect storm against upstream KDB).
         """
-        # Fast check under lock — are we already connected?
+        # Fast check under state lock — are we already connected / closed?
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("Client is closed; create a new instance.")
             if self._pool is not None:
                 return
-            self._closed = False
 
-        # Slow I/O outside the lock.
-        pool = q.AsyncPool(
-            self._endpoint,
-            options=self._decode_opts,
-            pool=self._pool_opts,
-        )
-        try:
-            if self._prewarm:
-                await pool.prewarm()
-        except BaseException:
+        # Serialize the actual connect I/O.  Other callers that lose the
+        # race will wake up, find self._pool populated, and return.
+        async with self._connect_lock:
+            async with self._lock:
+                if self._closed:
+                    raise RuntimeError("Client is closed; create a new instance.")
+                if self._pool is not None:
+                    return
+
+            # Slow I/O outside the state lock.
+            pool = q.AsyncPool(
+                self._endpoint,
+                options=self._decode_opts,
+                pool=self._pool_opts,
+            )
             try:
-                await pool.close()
-            except Exception:
-                pass
-            raise
+                if self._prewarm:
+                    await asyncio.wait_for(
+                        pool.prewarm(), timeout=_PREWARM_TIMEOUT_S,
+                    )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await pool.close()
+                raise
 
-        # Commit under lock — handle race with concurrent connect().
-        async with self._lock:
-            if self._pool is not None:
-                # Lost the race — another connect() finished first.
-                await pool.close()
-                return
-            self._pool = pool
+            # Commit under state lock.  Defer pool.close() to outside the
+            # lock to avoid blocking other tasks behind Rust-side I/O.
+            discard = False
+            async with self._lock:
+                if self._closed:
+                    discard = True
+                else:
+                    self._pool = pool
+
+            if discard:
+                with contextlib.suppress(Exception):
+                    await pool.close()
+                raise RuntimeError("Client closed during connect().")
 
     async def close(self) -> None:
         """Shut down the pool, release all connections, reject new queries.
 
         Snapshot-and-nil under lock, then close outside to avoid blocking.
+        After ``close()`` the client is terminal — subsequent ``connect()``
+        calls raise ``RuntimeError`` instead of silently resurrecting.
         """
         async with self._lock:
             old, self._pool = self._pool, None
             self._closed = True
         if old is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await old.close()
-            except Exception:
-                pass
 
     async def _reset_pool(self) -> None:
         """Destroy and recreate the pool.
 
         Used as a circuit-breaker when consecutive timeouts suggest the pool
         holds poisoned connections that qroissant failed to reclaim.
+        Reset does NOT flip ``_closed`` — the client remains usable.
         """
         async with self._lock:
             old = self._pool
             self._pool = None
             self._consecutive_timeouts = 0
         if old is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.wait_for(old.close(), timeout=2.0)
-            except Exception:
-                pass
         # Next query triggers _ensure_pool -> connect() automatically.
 
     async def reset(self) -> None:
@@ -493,8 +540,22 @@ class CadeKdb:
 
     @property
     def last_success_time(self) -> float:
-        """Monotonic timestamp of the last successful query, or ``0.0``."""
+        """Monotonic timestamp of the last successful query.
+
+        Initialized to the creation time so a brand-new pool is not
+        immediately eligible for idle eviction by the maintenance sweep.
+        """
         return self._last_success
+
+    @property
+    def last_activity_time(self) -> float:
+        """Monotonic timestamp of most recent relevant activity.
+
+        Returns the later of the creation time or the last successful
+        query.  Used by the manager's idle-eviction sweep so that a fresh
+        pool that has not served a query yet is not incorrectly trimmed.
+        """
+        return max(self._last_success, self._created_at)
 
     async def __aenter__(self) -> CadeKdb:
         if self._auto_connect:
@@ -515,16 +576,29 @@ class CadeKdb:
         return self._pool is not None and not self._closed
 
     async def _ensure_pool(self) -> q.AsyncPool:
-        """Return the live pool, auto-connecting if allowed."""
-        if self._pool is not None:
+        """Return the live pool, auto-connecting if allowed.
+
+        State transitions are checked under ``_lock`` to eliminate the
+        TOCTOU between ``_pool``/``_closed`` reads that the previous
+        lockless implementation exhibited.
+        """
+        async with self._lock:
+            if self._pool is not None:
+                return self._pool
+            if self._closed:
+                raise RuntimeError("Client is closed.")
+            if not self._auto_connect:
+                raise RuntimeError(
+                    "Not connected. Call connect() or set auto_connect=True."
+                )
+        await self.connect()
+        async with self._lock:
+            if self._pool is None:
+                # Closed or reset raced with us — surface it.
+                if self._closed:
+                    raise RuntimeError("Client is closed.")
+                raise RuntimeError("Pool unavailable after connect().")
             return self._pool
-        if self._closed:
-            raise RuntimeError("Client is closed.")
-        if self._auto_connect:
-            await self.connect()
-            assert self._pool is not None  # noqa: S101
-            return self._pool
-        raise RuntimeError("Not connected. Call connect() or set auto_connect=True.")
 
     # -- Querying ----------------------------------------------------------
 
