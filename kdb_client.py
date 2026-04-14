@@ -208,6 +208,12 @@ def _expand_dict(d: q.Dictionary) -> pl.DataFrame:
         vdf = pl.from_arrow(v)
         overlap = [c for c in vdf.columns if c in kdf.columns]
         if overlap:
+            _log.warning(
+                "_expand_dict: dropping %d duplicate column(s) from value "
+                "table to avoid DuplicateError in horizontal concat: %s",
+                len(overlap),
+                overlap,
+            )
             vdf = vdf.drop(overlap)
         return pl.concat([kdf, vdf], how="horizontal")
     # Non-table dictionary: let Polars handle via PyCapsule
@@ -728,11 +734,15 @@ class CadeKdb:
             Override the client's default qroissant decode options for this query
             (e.g. different symbol interpretation).
         """
-        pool = await self._ensure_pool()
+        # Validate timeout BEFORE the potentially expensive _ensure_pool()
+        # so that callers with an invalid timeout value get a fast, clean
+        # ValueError instead of discovering the problem only after a full
+        # connect+prewarm cycle has consumed part of the deadline.
         t = timeout if timeout is not None else self._query_timeout
-
         if t <= 0:
             raise ValueError(f"timeout must be positive, got {t!r}")
+
+        pool = await self._ensure_pool()
 
         # -- execute with cancellation + timeout hardening -----------------
         try:

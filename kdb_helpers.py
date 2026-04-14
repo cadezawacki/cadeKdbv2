@@ -17,6 +17,27 @@ if TYPE_CHECKING:
     import polars as pl
     from kdb_manager import ConnectionList, CadeKdbManager
 
+# ---------------------------------------------------------------------------
+# Optional date helpers (app-specific, may not be present in all deployments)
+# ---------------------------------------------------------------------------
+# Attempt the import ONCE at module load time so that callers to
+# construct_panoproxy_triplet() do not pay a filesystem-traversal cost on
+# every invocation when the module is absent.  Under CPython, a failed
+# ``from x import y`` inside a function body is not cached in sys.modules, so
+# each call retries the full import machinery — measurable overhead for
+# high-frequency routing helpers.
+
+try:
+    from app.helpers.date_helpers import (  # type: ignore[import-not-found]
+        get_today as _get_today,
+        is_today as _is_today,
+        parse_date as _parse_date,
+    )
+    _DATE_HELPERS_AVAILABLE = True
+except ImportError:
+    _get_today = _is_today = _parse_date = None  # type: ignore[assignment]
+    _DATE_HELPERS_AVAILABLE = False
+
 __all__ = [
     # Table name extraction
     "extract_table_name",
@@ -196,7 +217,10 @@ def _parse_condition(col: str, condition: Any) -> str:
         dtype = condition.get("dtype", "auto")
 
         if value is None:
-            return f"{col} is null"
+            # ``null col`` is valid q (checks for null across all KDB types).
+            # The previous ``"{col} is null"`` was SQL syntax and would raise
+            # a QRuntimeError on every KDB host.
+            return f"null {col}"
 
         if isinstance(value, (list, tuple, set)):
             items = _compact_seq(list(value))
@@ -466,7 +490,23 @@ def _q_int_list(vals: Sequence[int]) -> str:
 
 
 def _q_now_repeated(n: int) -> str:
-    return f"{int(n)}#enlist .z.t" if n > 1 else ".z.t"
+    """Return a q expression for a time vector of length *n* using ``.z.t``.
+
+    n=0 → ``0#enlist .z.t``   (empty time vector, not a scalar)
+    n=1 → ``enlist .z.t``     (single-element list, not a scalar)
+    n>1 → ``n#enlist .z.t``   (n identical copies)
+
+    The previous implementation returned the bare scalar ``.z.t`` for n≤1.
+    For n=0 that is wrong at the type level — KDB insert expects a vector
+    whose length matches every other column, not a scalar.  For n=1 a
+    scalar may work in some KDB contexts but is inconsistent with n>1.
+    """
+    n = int(n)
+    if n == 0:
+        return "0#enlist .z.t"
+    if n == 1:
+        return "enlist .z.t"
+    return f"{n}#enlist .z.t"
 
 
 def q_symbols(strings: Sequence[str]) -> _ColExpr:
@@ -502,7 +542,14 @@ def q_now(n_rows: int) -> _ColExpr:
 def build_insert_query_panoproxy(
     table_name: str, columns: Sequence[_ColExpr]
 ) -> str:
-    """Build a panoproxy-style insert expression."""
+    """Build a panoproxy-style insert expression.
+
+    *table_name* is validated against ``_SAFE_COL_RE`` so that a crafted
+    value such as ``"trade;system\\"rm -rf /\\""`` cannot inject arbitrary
+    q code into the intermediary.
+    """
+    if not isinstance(table_name, str) or not _SAFE_COL_RE.match(table_name):
+        raise ValueError(f"Unsafe table name rejected: {table_name!r}")
     parts = "; ".join(c.expr for c in columns)
     return f".utils.publishToRDB[`{table_name};({parts})]"
 
@@ -510,7 +557,13 @@ def build_insert_query_panoproxy(
 def build_insert_query_generic(
     table_name: str, columns: Sequence[_ColExpr]
 ) -> str:
-    """Build a generic q insert expression."""
+    """Build a generic q insert expression.
+
+    *table_name* is validated against ``_SAFE_COL_RE`` so that a crafted
+    value cannot inject arbitrary q code after the backtick symbol.
+    """
+    if not isinstance(table_name, str) or not _SAFE_COL_RE.match(table_name):
+        raise ValueError(f"Unsafe table name rejected: {table_name!r}")
     parts = "; ".join(c.expr for c in columns)
     return f"`{table_name} insert ({parts})"
 
@@ -521,6 +574,22 @@ def build_insert_query_generic(
 
 _GATEWAY_MAP = {"US": "nyk", "EU": "ldn", "SGP": "sgp"}
 _PANOPROXY_MAP = {"US": "us", "EU": "eu", "SGP": "sgp"}
+
+# Identifier regex reused for namespace/schema/table/stripe validation.
+# Allows dotted paths (.credit.nyk.refData) but the individual segments
+# must each be safe identifiers.
+_SAFE_NS_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_ns_segment(value: str, field: str) -> None:
+    """Reject any namespace segment that could splice q code.
+
+    Dotted path components (e.g. ``"credit"``, ``"refData"``) must each be a
+    bare identifier.  A value such as ``'foo;system"rm -rf /"'`` would inject
+    arbitrary q when interpolated into a namespace literal.
+    """
+    if not isinstance(value, str) or not _SAFE_NS_SEGMENT_RE.match(value):
+        raise ValueError(f"Unsafe {field} value rejected: {value!r}")
 
 
 @lru_cache(maxsize=128)
@@ -539,11 +608,18 @@ def construct_gateway_triplet(
 ) -> str:
     """Build a gateway-style table path.
 
+    All caller-supplied segments are validated against a strict identifier
+    regex to prevent q-code injection via crafted schema/table/stripe values.
+
     >>> construct_gateway_triplet("credit", "US", "refData")
     '.credit.nyk.refData'
     >>> construct_gateway_triplet("credit", "US", "refData", stripe="s1")
     '.credit.nyk.s1.refData'
     """
+    _validate_ns_segment(schema, "schema")
+    _validate_ns_segment(table, "table")
+    if stripe is not None:
+        _validate_ns_segment(stripe, "stripe")
     region = region_to_gateway(region)
     if stripe is not None:
         return f".{schema}.{region}.{stripe}.{table}"
@@ -569,24 +645,30 @@ def construct_panoproxy_triplet(
     If date logic dependencies (``is_today``, ``parse_date``, ``get_today``)
     are unavailable, defaults to ``"realtime"``.
 
+    *base* and *table* are validated against a strict identifier regex to
+    prevent q-code injection when these caller-controlled strings are
+    interpolated into the namespace literal.
+
     >>> construct_panoproxy_triplet("US", "refData")
     '.mt.get[`.credit.us.refData.realtime]'
     """
+    _validate_ns_segment(base, "base")
+    _validate_ns_segment(table, "table")
     region = region_to_panoproxy(region)
 
-    # Determine realtime vs historical.
+    # Determine realtime vs historical using the module-level cached helpers.
+    # The import is attempted once at module load time (_DATE_HELPERS_AVAILABLE)
+    # so this hot path never pays a filesystem-traversal cost per call.
     d = "realtime"
-    try:
-        # Try to import app-specific date helpers (optional dependency).
-        from app.helpers.date_helpers import get_today, is_today, parse_date
-
+    if _DATE_HELPERS_AVAILABLE:
         if isinstance(dates, list) and len(dates) > 1:
-            dts = [parse_date(x, biz=True) for x in dates]
-            d = "historical" if min(dts) < get_today(utc=True) else "realtime"
+            dts = [_parse_date(x, biz=True) for x in dates]  # type: ignore[misc]
+            d = "historical" if min(dts) < _get_today(utc=True) else "realtime"  # type: ignore[misc]
         else:
-            d = "realtime" if is_today(dates, utc=True) else "historical"
-    except ImportError:
-        # Date helpers not available — default to realtime.
+            d = "realtime" if _is_today(dates, utc=True) else "historical"  # type: ignore[misc]
+    else:
+        # Date helpers not available — default to realtime unless caller
+        # explicitly passes a non-None dates value (assume historical).
         if dates is not None:
             d = "historical"
 

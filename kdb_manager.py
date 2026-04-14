@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict, UserList
@@ -384,10 +385,34 @@ def _iter_credentials(
 # CadeKdbManager
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CREDS: list[tuple[str, str]] = [
-    ("credituser", "creditpass"),
-    ("produser", "prodpass"),
-]
+def _load_default_creds() -> list[tuple[str, str]]:
+    """Load default KDB credentials from environment variables.
+
+    Expected env vars (all optional; credentials are only added when both
+    halves of a pair are non-empty):
+
+      KDB_USER1 / KDB_PASS1  — primary credential
+      KDB_USER2 / KDB_PASS2  — secondary credential
+
+    Raises ``RuntimeError`` at startup (import time) if no credentials can
+    be found, so misconfigured deployments fail fast rather than attempting
+    connections with placeholder values.
+    """
+    pairs = [
+        (os.environ.get("KDB_USER1", ""), os.environ.get("KDB_PASS1", "")),
+        (os.environ.get("KDB_USER2", ""), os.environ.get("KDB_PASS2", "")),
+    ]
+    creds = [(u, p) for u, p in pairs if u and p]
+    if not creds:
+        raise RuntimeError(
+            "No KDB credentials configured. "
+            "Set KDB_USER1/KDB_PASS1 (and optionally KDB_USER2/KDB_PASS2) "
+            "environment variables before importing this module."
+        )
+    return creds
+
+
+_DEFAULT_CREDS: list[tuple[str, str]] = _load_default_creds()
 
 # Pre-built defaults to avoid per-call dataclass allocation.
 _DEFAULT_TRANSFORM_LAZY = CadeKdbTransformConfig(lazy=True)
@@ -1041,7 +1066,19 @@ class CadeKdbManager:
                         return result
 
             if errors:
-                raise next(iter(errors.values()))
+                # Surface every per-host failure so operators can diagnose
+                # systemic outages rather than seeing only the first error.
+                # The first error is used as the primary exception; the rest
+                # are attached as ``__context__`` via a chained raise so that
+                # logging frameworks and tracebacks expose the full picture.
+                exc_list = list(errors.values())
+                primary = exc_list[0]
+                for prev in exc_list[1:]:
+                    # Chain: later → earlier so traceback reads top-to-bottom
+                    # in arrival order.
+                    prev.__context__ = primary
+                    primary = prev
+                raise primary
             raise RuntimeError("Aggressive fan-out: all hosts failed.")
 
         try:
@@ -1110,7 +1147,20 @@ class CadeKdbManager:
                 raise ValueError(
                     f"Unsafe character in backdoor {field}; refusing to build"
                 )
-        escaped = expr.replace("\\", "\\\\").replace('"', '\\"')
+        # Escape backslash first, then double-quote, then the control
+        # characters that q's lexer treats as string terminators.  A bare
+        # newline or carriage-return inside a q string literal ends the
+        # string prematurely and allows injection of arbitrary q tokens.
+        # The previous implementation only escaped backslash and quote,
+        # leaving \n / \r / \t as live injection vectors.
+        escaped = (
+            expr
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
         return (
             f'(`$":{target_host}:{target_port}:{user}:{password}")'
             f'"{escaped}"'
