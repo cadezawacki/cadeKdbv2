@@ -662,6 +662,9 @@ class CadeKdbManager:
         implementation compared ``self._pools.get(key)`` to itself, which
         is trivially ``True`` and allowed the sweep to close brand-new
         pools that had replaced stale ones between scan and trim.
+
+        Uses ``try_metrics()`` (not ``metrics()``) so the probe cannot
+        silently auto-reconnect a pool that was nilled by a reset mid-scan.
         """
         now = time.monotonic()
         idle_cutoff = now - self._default_pool_config.idle_timeout_ms / 1000.0
@@ -673,13 +676,18 @@ class CadeKdbManager:
                 continue
             try:
                 m = await asyncio.wait_for(
-                    client.metrics(), timeout=_METRICS_TIMEOUT_S,
+                    client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 # Hung / errored pool — treat as eviction candidate so we
                 # reclaim it instead of stalling the maintenance loop.
+                candidates.append((key, client))
+                continue
+            if m is None:
+                # Pool was nilled between the connected check and the probe.
+                # Do NOT resurrect it via auto-connect — mark for eviction.
                 candidates.append((key, client))
                 continue
             if m.connections == 0 and client.last_activity_time < idle_cutoff:
@@ -1300,21 +1308,25 @@ class CadeKdbManager:
         """Return metrics for all managed pools.
 
         Each per-pool metrics call is bounded so that a single hung pool
-        cannot freeze the entire diagnostics call.
+        cannot freeze the entire diagnostics call.  Uses ``try_metrics()``
+        so diagnostic probes cannot accidentally auto-reconnect an evicted
+        or reset pool.
         """
         stats: dict[str, dict[str, Any]] = {}
         for key, client in list(self._pools.items()):
             try:
-                if client.connected:
-                    m = await asyncio.wait_for(
-                        client.metrics(), timeout=_METRICS_TIMEOUT_S,
-                    )
-                    stats[key] = {
-                        "connections": m.connections,
-                        "idle": m.idle_connections,
-                        "max_size": m.max_size,
-                        "last_success": client.last_success_time,
-                    }
+                m = await asyncio.wait_for(
+                    client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
+                )
+                if m is None:
+                    stats[key] = {"status": "disconnected"}
+                    continue
+                stats[key] = {
+                    "connections": m.connections,
+                    "idle": m.idle_connections,
+                    "max_size": m.max_size,
+                    "last_success": client.last_success_time,
+                }
             except asyncio.CancelledError:
                 raise
             except Exception:
