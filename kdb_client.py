@@ -445,12 +445,19 @@ class CadeKdb:
 
     # -- Lifecycle ---------------------------------------------------------
 
-    async def connect(self) -> None:
+    async def connect(self, *, connect_timeout: float | None = None) -> None:
         """Initialize the connection pool (idempotent).
 
         If ``prewarm`` is enabled, eagerly opens ``min_idle`` connections,
         bounded by ``_PREWARM_TIMEOUT_S`` so a stalled handshake cannot
         freeze the connect path.
+
+        ``connect_timeout`` (optional) overrides the hardcoded prewarm
+        cap with a tighter value (never a looser one).  The manager
+        passes the caller's *remaining* deadline budget here so a slow
+        handshake cannot silently blow the per-host budget: previously,
+        ``connect()`` would happily wait the full ``_PREWARM_TIMEOUT_S``
+        regardless of how much time the caller actually had left.
 
         A closed client stays closed: ``connect()`` on a closed instance
         raises ``RuntimeError`` instead of silently resurrecting — once
@@ -460,6 +467,17 @@ class CadeKdb:
         on a cold client produce exactly ONE prewarm, not N (preventing
         a reconnect storm against upstream KDB).
         """
+        # Compute the prewarm deadline.  The caller-supplied value only
+        # tightens the hardcoded cap — it never relaxes it.
+        if connect_timeout is None:
+            prewarm_timeout = _PREWARM_TIMEOUT_S
+        elif connect_timeout <= 0:
+            raise asyncio.TimeoutError(
+                "connect_timeout expired before prewarm could start"
+            )
+        else:
+            prewarm_timeout = min(connect_timeout, _PREWARM_TIMEOUT_S)
+
         # Fast check under state lock — are we already connected / closed?
         async with self._lock:
             if self._closed:
@@ -485,7 +503,7 @@ class CadeKdb:
             try:
                 if self._prewarm:
                     await asyncio.wait_for(
-                        pool.prewarm(), timeout=_PREWARM_TIMEOUT_S,
+                        pool.prewarm(), timeout=prewarm_timeout,
                     )
             except BaseException:
                 with contextlib.suppress(Exception):
