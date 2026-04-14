@@ -70,12 +70,17 @@ def _parse_conn(
     """
     if conn_str is not None:
         s = conn_str.lstrip(":")
-        parts = s.split(":")
-        if len(parts) >= 4:
+        # Cap splits at 3 so a password containing ``:`` is not silently
+        # truncated at the first embedded colon.  Previously ``host:port:u:p:w``
+        # split into 5 parts and everything after the first password colon
+        # was lost, producing silent authentication failures on high-entropy
+        # passwords.
+        parts = s.split(":", 3)
+        if len(parts) == 4:
             return parts[0], int(parts[1]), parts[2] or username, parts[3] or password
         if len(parts) == 3:
             return parts[0], int(parts[1]), parts[2] or username, password
-        if len(parts) >= 2:
+        if len(parts) == 2:
             return parts[0], int(parts[1]), username, password
         raise ValueError(f"Cannot parse connection string: {conn_str!r}")
     if host is not None and port is not None:
@@ -507,13 +512,21 @@ class CadeKdb:
         Snapshot-and-nil under lock, then close outside to avoid blocking.
         After ``close()`` the client is terminal — subsequent ``connect()``
         calls raise ``RuntimeError`` instead of silently resurrecting.
+
+        Exceptions from the underlying ``pool.close()`` are logged rather
+        than silently swallowed — operators need this signal to diagnose
+        resource leaks and shutdown-path bugs in production.
         """
         async with self._lock:
             old, self._pool = self._pool, None
             self._closed = True
         if old is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await old.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.exception("kdb pool close failed during CadeKdb.close()")
 
     async def _reset_pool(self) -> None:
         """Destroy and recreate the pool.
@@ -521,14 +534,26 @@ class CadeKdb:
         Used as a circuit-breaker when consecutive timeouts suggest the pool
         holds poisoned connections that qroissant failed to reclaim.
         Reset does NOT flip ``_closed`` — the client remains usable.
+
+        Exceptions from the underlying close are logged, not silently
+        swallowed — a failing close under pressure is a diagnosis signal,
+        not noise to hide.
         """
         async with self._lock:
             old = self._pool
             self._pool = None
             self._consecutive_timeouts = 0
         if old is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await asyncio.wait_for(old.close(), timeout=2.0)
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                _log.warning(
+                    "kdb pool close timed out during reset; abandoning handle"
+                )
+            except Exception:
+                _log.exception("kdb pool close failed during reset")
         # Next query triggers _ensure_pool -> connect() automatically.
 
     async def reset(self) -> None:
@@ -581,24 +606,32 @@ class CadeKdb:
         State transitions are checked under ``_lock`` to eliminate the
         TOCTOU between ``_pool``/``_closed`` reads that the previous
         lockless implementation exhibited.
+
+        A bounded retry loop handles the narrow race where a concurrent
+        ``_reset_pool()`` nils ``_pool`` between ``connect()`` returning
+        and the post-connect re-lock — the previous implementation
+        surfaced a spurious ``RuntimeError`` in that case, causing
+        callers to observe transient failures during circuit-breaker
+        resets that had nothing to do with their query.
         """
-        async with self._lock:
-            if self._pool is not None:
-                return self._pool
-            if self._closed:
-                raise RuntimeError("Client is closed.")
-            if not self._auto_connect:
-                raise RuntimeError(
-                    "Not connected. Call connect() or set auto_connect=True."
-                )
-        await self.connect()
-        async with self._lock:
-            if self._pool is None:
-                # Closed or reset raced with us — surface it.
+        for _ in range(3):
+            async with self._lock:
+                if self._pool is not None:
+                    return self._pool
                 if self._closed:
                     raise RuntimeError("Client is closed.")
-                raise RuntimeError("Pool unavailable after connect().")
-            return self._pool
+                if not self._auto_connect:
+                    raise RuntimeError(
+                        "Not connected. Call connect() or set auto_connect=True."
+                    )
+            await self.connect()
+            async with self._lock:
+                if self._pool is not None:
+                    return self._pool
+                if self._closed:
+                    raise RuntimeError("Client is closed.")
+                # Reset raced with us — loop and try again.
+        raise RuntimeError("Pool unavailable after connect() retries.")
 
     # -- Querying ----------------------------------------------------------
 
@@ -684,9 +717,15 @@ class CadeKdb:
             # Pool was closed by a concurrent close() / reset().
             raise
         else:
+            # Update success counters and timestamp under a single lock
+            # so a racing reader (e.g. ``last_activity_time``) never sees
+            # a torn pairing of reset-counter + stale timestamp.  Under
+            # free-threaded / no-GIL CPython, a bare float attribute
+            # write can tear relative to the counter reset.
+            now = time.monotonic()
             async with self._lock:
                 self._consecutive_timeouts = 0
-            self._last_success = time.monotonic()
+                self._last_success = now
 
         if output == "arrow":
             return value
@@ -708,4 +747,20 @@ class CadeKdb:
     async def metrics(self) -> q.PoolMetrics:
         """Snapshot of pool occupancy, idle count, and configuration."""
         pool = await self._ensure_pool()
+        return await pool.metrics()
+
+    async def try_metrics(self) -> q.PoolMetrics | None:
+        """Metrics snapshot that NEVER triggers auto-connect.
+
+        Returns ``None`` if the pool is absent or the client is closed.
+        Intended for maintenance sweeps and diagnostic callers that must
+        not accidentally resurrect an evicted / reset pool — calling
+        ``metrics()`` goes through ``_ensure_pool()`` which auto-connects
+        under default settings, turning a read-only probe into a
+        fire-and-forget reconnection storm under unstable conditions.
+        """
+        async with self._lock:
+            if self._pool is None or self._closed:
+                return None
+            pool = self._pool
         return await pool.metrics()

@@ -71,11 +71,39 @@ def extract_table_name(s: str) -> str | None:
 # KDB WHERE / BY / FBY clause builders
 # ---------------------------------------------------------------------------
 
-_SAFE_COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_. ]*$")
+# Strict column identifier: letters/digits/underscore/dot only.  Whitespace,
+# semicolons, quotes, backticks — anything that could terminate or splice the
+# surrounding q expression — is rejected outright.
+_SAFE_COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+# Support the "not col" form used when condition is None (i.e. `not null col`).
+_SAFE_NOT_COL_RE = re.compile(r"^not\s+([A-Za-z_][A-Za-z0-9_.]*)$")
+# Valid aggregation method names for kdb_col_select_helper.
+_SAFE_METHOD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Characters that are unsafe inside a q symbol literal — backticks, semicolons,
 # whitespace, quotes, and backslashes can all terminate or splice the symbol
 # and allow injection of arbitrary q code.
 _UNSAFE_SYM_RE = re.compile(r"[`;\s\"\\]")
+
+
+def _validate_col(col: str) -> tuple[str, str | None]:
+    """Validate a column expression.
+
+    Returns ``(bare_col, not_form_col | None)``.  If the caller passed
+    ``"not colname"``, *not_form_col* is the full matched expression and
+    *bare_col* is the underlying column name.  Otherwise *not_form_col*
+    is ``None`` and *bare_col* is the validated column name.
+
+    This is the sole injection guard for WHERE fragments — callers must
+    rely on it to reject any input that could splice arbitrary q code.
+    """
+    if not isinstance(col, str):
+        raise ValueError(f"Unsafe column rejected: {col!r}")
+    m = _SAFE_NOT_COL_RE.match(col)
+    if m is not None:
+        return m.group(1), col
+    if _SAFE_COL_RE.match(col):
+        return col, None
+    raise ValueError(f"Unsafe column rejected: {col!r}")
 
 
 def _q_escape_str(s: str) -> str:
@@ -122,13 +150,24 @@ def _parse_condition(col: str, condition: Any) -> str:
     def _compact_seq(seq: Sequence[Any]) -> list[Any]:
         return [x for x in seq if x is not None]
 
-    # Guard against q injection via crafted column names
-    col_name = col.split(" ")[-1] if " " in col else col
-    if not _SAFE_COL_RE.match(col_name):
-        raise ValueError(f"Unsafe column name rejected: {col_name!r}")
+    # Guard against q injection via crafted column names.  The FULL col
+    # expression is validated — not just a trailing token — so that
+    # strings like ``"foo;system\"rm -rf\""`` cannot splice arbitrary q.
+    bare_col, not_form = _validate_col(col)
 
     if condition is None:
-        return f"not null {col.split(' ')[-1]}" if "not" in col else f"null {col}"
+        if not_form is not None:
+            return f"not null {bare_col}"
+        return f"null {bare_col}"
+
+    # Conditions with operators (``=``, ``in``) only make sense on a plain
+    # column, not the ``not col`` form.  Reject to prevent producing
+    # invalid / ambiguous q expressions like ``"not col=val"``.
+    if not_form is not None:
+        raise ValueError(
+            f"'not col' form only valid with None condition: {col!r}"
+        )
+    col = bare_col
 
     # ``bool`` MUST be checked before ``int`` — bool is a subclass of int.
     if isinstance(condition, bool):
@@ -229,6 +268,9 @@ def kdb_where(*filters: dict[str, Any]) -> str:
     return build_kdb_where(list(filters))
 
 
+_FBY_DIRECTIONS = frozenset({"first", "last"})
+
+
 def kdb_fby(
     vars: str | list[str], d: str = "last", letter: str | None = None
 ) -> str:
@@ -242,9 +284,27 @@ def kdb_fby(
         Aggregation direction (``"first"`` or ``"last"``).
     letter : str, optional
         Row-index variable (defaults to ``"i"`` for first, ``"j"`` for last).
+
+    All inputs are validated against strict identifier regexes to prevent
+    q-expression injection — prior versions spliced *d*, *letter*, and
+    *vars* directly into the output string, allowing a caller-controlled
+    value such as ``d='first;system "rm -rf /"'`` to execute arbitrary q.
     """
-    l = letter or {"first": "i", "last": "j"}.get(d)
-    f = f"([]{';'.join(vars)})" if isinstance(vars, list) else vars
+    if d not in _FBY_DIRECTIONS:
+        raise ValueError(f"Invalid fby direction: {d!r}")
+    if letter is not None and not _SAFE_METHOD_RE.match(letter):
+        raise ValueError(f"Invalid fby letter: {letter!r}")
+    l = letter or {"first": "i", "last": "j"}[d]
+
+    if isinstance(vars, list):
+        for v in vars:
+            if not isinstance(v, str) or not _SAFE_COL_RE.match(v):
+                raise ValueError(f"Invalid fby var: {v!r}")
+        f = f"([]{';'.join(vars)})"
+    else:
+        if not isinstance(vars, str) or not _SAFE_COL_RE.match(vars):
+            raise ValueError(f"Invalid fby var: {vars!r}")
+        f = vars
     return f"{l} = ({d}; {l}) fby {f}"
 
 
@@ -256,6 +316,9 @@ def kdb_by(vars: str | list[str]) -> str:
     """
     if isinstance(vars, str):
         vars = [vars]
+    for v in vars:
+        if not isinstance(v, str) or not _SAFE_COL_RE.match(v):
+            raise ValueError(f"Invalid by var: {v!r}")
     return " by " + ",".join(vars)
 
 
@@ -269,31 +332,45 @@ def kdb_col_select_helper(
     Parameters
     ----------
     col_lst : list[str]
-        Column names.  ``"alias:col"`` syntax supported.
+        Column names.  ``"alias:col"`` syntax supported — both halves must
+        be valid q identifiers.
     method : str or None
         Aggregation (``"first"``, ``"last"``, ``"avg"``, …).
         ``None`` or ``"none"`` for no aggregation.
     fills : bool
         Wrap each column in ``fills[...]``.
+
+    All caller-provided strings are validated against strict identifier
+    regexes to block q-expression injection.  Prior versions interpolated
+    raw strings into the output, allowing ``";system \"rm -rf /\""`` and
+    similar to execute arbitrary q on the remote host.
     """
     if not col_lst:
         return ""
     if method is None or method == "none":
         method = ""
+    elif not _SAFE_METHOD_RE.match(method):
+        raise ValueError(f"Unsafe aggregation method: {method!r}")
     out: list[str] = []
     seen: set[str] = set()
     if method != "" and not method.endswith(" "):
         method += " "
     for col in col_lst:
+        if not isinstance(col, str):
+            raise ValueError(f"Unsafe column entry: {col!r}")
         if col in seen:
             continue
         seen.add(col)
         if ":" in col:
             a, b = col.split(":", 1)
+            if not _SAFE_METHOD_RE.match(a) or not _SAFE_COL_RE.match(b):
+                raise ValueError(f"Unsafe column entry: {col!r}")
             if fills:
                 b = f"fills[{b}]"
             out.append(f"{a}:{method}{b}")
         else:
+            if not _SAFE_COL_RE.match(col):
+                raise ValueError(f"Unsafe column entry: {col!r}")
             c = f"fills[{col}]" if fills else col
             out.append(f"{method}{c}")
     return ",".join(out) if out else ""
