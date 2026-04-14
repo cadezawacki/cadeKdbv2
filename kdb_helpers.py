@@ -410,7 +410,20 @@ def _q_string_list(strings: Sequence[str]) -> str:
     return "(" + ";".join(_q_escape_string(str(x)) for x in strings) + ")"
 
 
+_Q_LONG_MAX = (1 << 63) - 1
+_Q_LONG_MIN = -(1 << 63)
+
+
 def _q_float_list(vals: Sequence[float | None]) -> str:
+    """Serialize a sequence of floats as a q float-vector literal.
+
+    Uses ``repr()`` for round-trip-accurate IEEE-754 serialization.  The
+    previous implementation formatted with ``.6f`` (fallback) / ``.3f``
+    (integers), which silently collapsed any non-zero magnitude below
+    ~5e-7 to ``0.0`` and truncated decimal places beyond 6 — catastrophic
+    for financial data where both tiny-but-nonzero values and full double
+    precision matter.
+    """
     if not vals:
         return "0#0f"
     out: list[str] = []
@@ -419,11 +432,12 @@ def _q_float_list(vals: Sequence[float | None]) -> str:
             out.append("0n")
             continue
         fv = float(v)
-        txt = (
-            f"{fv:.3f}"
-            if fv == round(fv, 3)
-            else f"{fv:.6f}".rstrip("0").rstrip(".")
-        )
+        if math.isinf(fv):
+            out.append("0w" if fv > 0 else "-0w")
+            continue
+        txt = repr(fv)
+        # Ensure the token is parsed as a float in q (append ``.0`` if no
+        # decimal point or exponent is present — e.g. ``100`` → ``100.0``).
         if "." not in txt and "e" not in txt and "E" not in txt:
             txt += ".0"
         out.append(txt)
@@ -431,9 +445,24 @@ def _q_float_list(vals: Sequence[float | None]) -> str:
 
 
 def _q_int_list(vals: Sequence[int]) -> str:
+    """Serialize a sequence of ints as a q long-vector literal.
+
+    Enforces the q ``long`` (int64) range — Python ints are arbitrary
+    precision, q longs are not.  Passing ``2**63`` previously emitted an
+    overflowing literal that silently corrupted the remote column.
+    """
     if not vals:
         return "0#0j"
-    return " ".join(str(int(v)) for v in vals)
+    out: list[str] = []
+    for v in vals:
+        iv = int(v)
+        if not (_Q_LONG_MIN <= iv <= _Q_LONG_MAX):
+            raise ValueError(
+                f"Integer {iv} outside q long range "
+                f"[{_Q_LONG_MIN}, {_Q_LONG_MAX}]"
+            )
+        out.append(str(iv))
+    return " ".join(out)
 
 
 def _q_now_repeated(n: int) -> str:

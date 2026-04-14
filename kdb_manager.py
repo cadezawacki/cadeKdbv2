@@ -434,6 +434,7 @@ class CadeKdbManager:
     __slots__ = (
         "_pools",
         "_lock",
+        "_key_locks",
         "_auth_cache",
         "_credentials",
         "_default_pool_config",
@@ -457,6 +458,13 @@ class CadeKdbManager:
     ) -> None:
         self._pools: dict[str, CadeKdb] = {}
         self._lock = asyncio.Lock()
+        # Per-key creation locks serialize concurrent ``get_or_create`` calls
+        # targeting the SAME ``host:port[:name]``.  Without this, N cold
+        # queries against a single host each open a full TCP-auth-prewarm
+        # cycle in parallel before the commit-lock deduplicates — a
+        # reconnect storm that CadeKdb goes to lengths to prevent per-instance
+        # but the manager previously re-introduced at the registry level.
+        self._key_locks: dict[str, asyncio.Lock] = {}
         self._auth_cache = AuthCache()
         self._credentials: list[tuple[str, str]] = list(credentials or _DEFAULT_CREDS)
         self._default_pool_config = pool_config or CadeKdbPoolConfig()
@@ -544,77 +552,97 @@ class CadeKdbManager:
         name: str | None = None,
         pool_config: CadeKdbPoolConfig | None = None,
         connection_timeout_ms: int | None = None,
+        connect_timeout: float | None = None,
     ) -> CadeKdb:
         """Return an existing pool or create a new one for ``host:port``.
 
-        Lock is held only for dict reads/writes — slow network I/O
-        (connect + prewarm) happens outside the lock to avoid blocking
-        concurrent callers targeting different hosts.
+        Creation is serialized per-key via ``self._key_locks[key]`` so
+        that N concurrent cold queries for the SAME host produce exactly
+        ONE connect+prewarm cycle, not N (preventing a reconnect storm
+        against upstream KDB).  Concurrent callers targeting DIFFERENT
+        hosts never touch each other's per-key lock and remain parallel.
+
+        ``connect_timeout`` (optional) bounds the prewarm phase to the
+        caller's remaining deadline budget, so a slow handshake cannot
+        silently exceed a per-host timeout that ``_try_host`` already
+        accounted for.
         """
         key = self._pool_key(host, port, name)
 
-        # Fast path — no lock.
+        # Fast path — no lock, no I/O.
         existing = self._pools.get(key)
         if existing is not None and existing.connected:
             return existing
 
-        # Determine credentials and create client under lock (no I/O).
+        # Obtain (or lazily create) the per-key creation lock under the
+        # global lock.  The per-key lock itself is only held for the
+        # duration of one creation attempt.
         async with self._lock:
+            key_lock = self._key_locks.get(key)
+            if key_lock is None:
+                key_lock = asyncio.Lock()
+                self._key_locks[key] = key_lock
+
+        async with key_lock:
+            # Re-check under the per-key lock — another task may have
+            # just completed creation.
             existing = self._pools.get(key)
             if existing is not None and existing.connected:
                 return existing
 
-            # Evict stale entry if present.
-            stale = self._pools.pop(key, None)
+            # Resolve credentials and construct client under the global
+            # lock (Python-only, no I/O).
+            async with self._lock:
+                stale = self._pools.pop(key, None)
 
-            u, p = username, password
-            if u is None or p is None:
-                cached = self._auth_cache.get(host, port)
-                if cached:
-                    u, p = cached
-                elif self._credentials:
-                    u, p = self._credentials[0]
+                u, p = username, password
+                if u is None or p is None:
+                    cached = self._auth_cache.get(host, port)
+                    if cached:
+                        u, p = cached
+                    elif self._credentials:
+                        u, p = self._credentials[0]
 
-            ct = connection_timeout_ms or self._connection_timeout_ms
-            client = CadeKdb(
-                host=host,
-                port=port,
-                username=u,
-                password=p,
-                connection_timeout_ms=ct,
-                query_timeout=self._query_timeout,
-                pool=pool_config or self._default_pool_config,
-                transform=self._default_transform,
-            )
-
-        # Best-effort close of stale entry (outside lock).
-        if stale is not None:
-            try:
-                await asyncio.wait_for(stale.close(), timeout=2.0)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _log.exception(
-                    "stale pool close failed for %s:%s", host, port
+                ct = connection_timeout_ms or self._connection_timeout_ms
+                client = CadeKdb(
+                    host=host,
+                    port=port,
+                    username=u,
+                    password=p,
+                    connection_timeout_ms=ct,
+                    query_timeout=self._query_timeout,
+                    pool=pool_config or self._default_pool_config,
+                    transform=self._default_transform,
                 )
 
-        # Connect outside lock — slow I/O won't block other hosts.
-        try:
-            await client.connect()
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await client.close()
-            raise
+            # Best-effort close of stale entry (outside global lock, still
+            # inside per-key lock so no other task can race us here).
+            if stale is not None:
+                try:
+                    await asyncio.wait_for(stale.close(), timeout=2.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _log.exception(
+                        "stale pool close failed for %s:%s", host, port
+                    )
 
-        # Commit under lock — handle race with concurrent get_or_create().
-        async with self._lock:
-            race_winner = self._pools.get(key)
-            if race_winner is not None and race_winner.connected:
-                # Lost the race — discard ours.
+            # Slow connect+prewarm I/O, bounded by the caller's remaining
+            # deadline when supplied.
+            try:
+                await client.connect(connect_timeout=connect_timeout)
+            except BaseException:
                 with contextlib.suppress(Exception):
                     await client.close()
-                return race_winner
-            self._pools[key] = client
+                raise
+
+            # Commit under global lock.  With the per-key lock held we are
+            # guaranteed there is no concurrent creator for this key, so
+            # the old "race winner" branch can be simplified to a direct
+            # install.
+            async with self._lock:
+                self._pools[key] = client
+
             return client
 
     async def remove_pool(
@@ -670,7 +698,16 @@ class CadeKdbManager:
         idle_cutoff = now - self._default_pool_config.idle_timeout_ms / 1000.0
         candidates: list[tuple[str, CadeKdb]] = []
 
-        for key, client in list(self._pools.items()):
+        # Take the snapshot under the global lock so concurrent
+        # ``get_or_create`` / ``remove_pool`` cannot mutate the dict
+        # mid-iteration — under free-threaded CPython a plain
+        # ``list(self._pools.items())`` would race and can raise
+        # ``RuntimeError: dictionary changed size during iteration``
+        # or produce a torn snapshot.
+        async with self._lock:
+            snapshot = list(self._pools.items())
+
+        for key, client in snapshot:
             if not client.connected:
                 candidates.append((key, client))
                 continue
@@ -755,10 +792,25 @@ class CadeKdbManager:
                     password=password,
                     name=hc.name,
                     connection_timeout_ms=conn_ms,
+                    # Pass the remaining deadline budget so prewarm cannot
+                    # silently exceed the caller's timeout.
+                    connect_timeout=remaining,
                 )
+                # Recompute the deadline budget AFTER pool creation — a
+                # slow connect / prewarm / stale-close can consume most
+                # of the original ``remaining``.  Reusing the stale value
+                # would hand ``client.query`` a budget longer than the
+                # caller's actual wall-clock headroom, silently leaking
+                # the failover deadline.
+                query_budget = deadline - time.monotonic()
+                if query_budget <= 0:
+                    raise TimeoutError(
+                        f"Deadline exceeded after pool creation for "
+                        f"{hc.host}:{hc.port}"
+                    )
                 result = await client.query(
                     expr,
-                    timeout=remaining,
+                    timeout=query_budget,
                     output=output,
                     transform=transform,
                     decode=decode,
@@ -870,6 +922,17 @@ class CadeKdbManager:
         if not tasks:
             raise RuntimeError("No hosts to query.")
 
+        # Closure-captured slot for a committed race win.  Populated
+        # BEFORE ``_race()`` enters the shielded post-win drain.  If the
+        # outer ``wait_for`` fires during that drain, the ``shield`` call
+        # cannot actually prevent the awaiter itself from receiving
+        # ``CancelledError`` — it only keeps the inner gather running.
+        # Without this slot, the successful result is silently dropped
+        # and the caller sees a spurious ``TimeoutError`` against an
+        # already-answered query.  This is the whole point of exposing
+        # the result to the outer ``except TimeoutError`` handler.
+        result_holder: list[Any] = []
+
         async def _race() -> Union[pl.LazyFrame, pl.DataFrame, q.Value]:
             pending: set[asyncio.Task[Any]] = set(tasks)
             errors: dict[str, BaseException] = {}
@@ -901,14 +964,18 @@ class CadeKdbManager:
                     except Exception as e:
                         errors[label] = e
                     else:
+                        # Commit the result to the outer holder BEFORE
+                        # the shielded drain.  The shield keeps the
+                        # inner gather alive under cancellation but
+                        # does NOT prevent the await here from raising
+                        # CancelledError, so ``return result`` below
+                        # may never execute under a racing outer
+                        # timeout.  The holder is the single source of
+                        # truth recoverable from the except handler.
+                        result_holder.append(result)
                         for p in pending:
                             p.cancel()
                         if pending:
-                            # SHIELD the drain: without this, if the outer
-                            # asyncio.wait_for deadline expires while we're
-                            # waiting for cancelled siblings to finish, the
-                            # successfully-obtained result is LOST and the
-                            # caller sees a spurious TimeoutError.
                             await asyncio.shield(
                                 asyncio.gather(
                                     *pending, return_exceptions=True
@@ -925,6 +992,11 @@ class CadeKdbManager:
             # connect()/prewarm() phases cannot exceed the deadline.
             return await asyncio.wait_for(_race(), timeout=timeout)
         except asyncio.TimeoutError:
+            # If the race already committed a result, hand it back
+            # rather than raising — the outer wait_for cancelled
+            # ``_race`` mid-drain, but the winning host DID answer.
+            if result_holder:
+                return result_holder[0]
             raise
         finally:
             for t in tasks:
@@ -1313,7 +1385,11 @@ class CadeKdbManager:
         or reset pool.
         """
         stats: dict[str, dict[str, Any]] = {}
-        for key, client in list(self._pools.items()):
+        # Snapshot under the lock — see ``_trim_idle_pools`` for the
+        # rationale (free-threaded CPython dict-mutation race).
+        async with self._lock:
+            snapshot = list(self._pools.items())
+        for key, client in snapshot:
             try:
                 m = await asyncio.wait_for(
                     client.try_metrics(), timeout=_METRICS_TIMEOUT_S,
