@@ -110,6 +110,15 @@ def _is_transport_error(exc: BaseException) -> bool:
     return any(kw in msg for kw in _TRANSPORT_KEYWORDS)
 
 
+class _EmptyResultError(RuntimeError):
+    """Internal signal raised inside ``_try_host`` when a query returns
+    empty and the caller set ``empty_is_failure=True``.  Caught by the
+    sequential/aggressive strategies so failover fires against the next
+    host; the top-level ``query()`` converts the survivor into the
+    user-facing ``RuntimeError`` when every host returned empty.
+    """
+
+
 # ---------------------------------------------------------------------------
 # ConnectionList / fconn  (ported from old connections module)
 # ---------------------------------------------------------------------------
@@ -304,38 +313,60 @@ def _resolve_hosts(
 
 
 class AuthCache:
-    """LRU-bounded cache of successful (host, port) -> (user, password) mappings.
+    """LRU-bounded cache of successful (host, port, name) -> (user, password).
+
+    The optional ``name`` component distinguishes logical pools that target
+    the same ``host:port`` but may legitimately use different credentials —
+    keying on ``(host, port)`` alone let such pools clobber one another.
 
     Uses an explicit ``threading.Lock`` so that concurrent reads/writes are
     safe under free-threaded / no-GIL CPython builds, not just relying on
     the implicit atomicity of individual ``OrderedDict`` ops under the GIL.
+
+    A ``None`` password represents a successful no-auth attempt so that
+    rotation against gateways that reject credentials can short-circuit on
+    subsequent calls.
     """
 
     __slots__ = ("_cache", "_maxsize", "_lock")
 
     def __init__(self, maxsize: int = 1024) -> None:
-        self._cache: OrderedDict[tuple[str, int], tuple[str, str]] = OrderedDict()
+        self._cache: OrderedDict[
+            tuple[str, int, str | None], tuple[str | None, str | None]
+        ] = OrderedDict()
         self._maxsize = maxsize
         self._lock = threading.Lock()
 
-    def get(self, host: str, port: int) -> tuple[str, str] | None:
+    def get(
+        self, host: str, port: int, name: str | None = None
+    ) -> tuple[str | None, str | None] | None:
+        key = (host, port, name)
         with self._lock:
-            pair = self._cache.get((host, port))
+            pair = self._cache.get(key)
             if pair is not None:
-                self._cache.move_to_end((host, port))
+                self._cache.move_to_end(key)
             return pair
 
-    def remember(self, host: str, port: int, user: str, password: str) -> None:
-        key = (host, port)
+    def remember(
+        self,
+        host: str,
+        port: int,
+        user: str | None,
+        password: str | None,
+        name: str | None = None,
+    ) -> None:
+        key = (host, port, name)
         with self._lock:
             self._cache[key] = (user, password)
             self._cache.move_to_end(key)
             if len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
-    def forget(self, host: str, port: int) -> None:
+    def forget(
+        self, host: str, port: int, name: str | None = None
+    ) -> None:
         with self._lock:
-            self._cache.pop((host, port), None)
+            self._cache.pop((host, port, name), None)
 
     def clear(self) -> None:
         with self._lock:
@@ -351,31 +382,47 @@ def _iter_credentials(
     hc: HostConfig,
     auth_cache: AuthCache,
     default_creds: Sequence[tuple[str, str]],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str | None, str | None]]:
     """Build an ordered list of (user, password) to try for *hc*.
 
-    Priority: explicit on HostConfig > auth cache > default combos.
+    Priority: explicit on HostConfig > auth cache > default combos, followed
+    by a single no-auth ``(None, None)`` attempt as a last resort.
+
+    The no-auth fallback is what allows this client to reach gateways that
+    reject credentials — previously the list filtered ``None`` entries and
+    then fell back to ``_DEFAULT_CREDS``, guaranteeing that every handshake
+    against a no-auth gateway sent bogus ``credituser:creditpass`` bytes
+    and was rejected.  Keeping the no-auth attempt at the TAIL preserves
+    the auth-required path: credentialed combos are tried first, and
+    ``(None, None)`` is only reached when they are exhausted or absent.
+
     Deduplicates while preserving order.
     """
-    seen: set[tuple[str, str]] = set()
-    result: list[tuple[str, str]] = []
+    seen: set[tuple[str | None, str | None]] = set()
+    result: list[tuple[str | None, str | None]] = []
 
     def _add(u: str | None, p: str | None) -> None:
-        if u is None or p is None:
-            return
         pair = (u, p)
         if pair not in seen:
             seen.add(pair)
             result.append(pair)
 
-    _add(hc.username, hc.password)
+    # Explicit on HostConfig — include even when only one half is set so
+    # that a no-password user (common on some gateways) is actually tried.
+    if hc.username is not None or hc.password is not None:
+        _add(hc.username, hc.password)
 
-    cached = auth_cache.get(hc.host, hc.port)
-    if cached:
+    cached = auth_cache.get(hc.host, hc.port, hc.name)
+    if cached is not None:
         _add(cached[0], cached[1])
 
     for u, p in default_creds:
         _add(u, p)
+
+    # Final fallback: anonymous handshake.  Cheap — qroissant elides the
+    # auth frame when both are None, so this is genuinely "no credentials"
+    # on the wire rather than empty-string credentials.
+    _add(None, None)
 
     return result
 
@@ -570,6 +617,7 @@ class CadeKdbManager:
         pool_config: CadeKdbPoolConfig | None = None,
         connection_timeout_ms: int | None = None,
         connect_timeout: float | None = None,
+        allow_anonymous: bool = False,
     ) -> CadeKdb:
         """Return an existing pool or create a new one for ``host:port``.
 
@@ -583,6 +631,12 @@ class CadeKdbManager:
         caller's remaining deadline budget, so a slow handshake cannot
         silently exceed a per-host timeout that ``_try_host`` already
         accounted for.
+
+        ``allow_anonymous`` opts out of the default-credential fallback
+        when BOTH ``username`` and ``password`` are ``None`` — required to
+        reach gateways that reject any auth frame.  Without it, the
+        manager silently substitutes ``_DEFAULT_CREDS[0]`` and the gateway
+        rejects the handshake.
         """
         key = self._pool_key(host, port, name)
 
@@ -617,9 +671,9 @@ class CadeKdbManager:
                     stale = self._pools.pop(key, None)
 
                     u, p = username, password
-                    if u is None or p is None:
-                        cached = self._auth_cache.get(host, port)
-                        if cached:
+                    if not allow_anonymous and u is None and p is None:
+                        cached = self._auth_cache.get(host, port, name)
+                        if cached is not None:
                             u, p = cached
                         elif self._credentials:
                             u, p = self._credentials[0]
@@ -809,18 +863,32 @@ class CadeKdbManager:
         self,
         expr: str,
         hc: HostConfig,
-        creds: list[tuple[str, str]],
+        creds: list[tuple[str | None, str | None]],
         *,
         timeout: float,
         output: Literal["polars", "arrow"],
         transform: CadeKdbTransformConfig | None,
         decode: q.DecodeOptions | None,
+        empty_is_failure: bool = False,
     ) -> Union[pl.LazyFrame, pl.DataFrame, q.Value]:
         """Try *expr* on a single host, rotating through *creds* on auth failure.
 
         All credential attempts share a single deadline so total wall-clock
         cannot exceed *timeout*.  Without this, N credentials × M hosts ×
         timeout can silently blow the caller's budget.
+
+        ``creds`` may contain a ``(None, None)`` entry — this represents a
+        no-auth handshake for gateways that reject credentials.  The
+        fallback is passed through to ``get_or_create`` with
+        ``allow_anonymous=True`` so the manager's default-credential
+        substitution is bypassed.
+
+        ``empty_is_failure`` raises ``_EmptyResultError`` when the query
+        returns an empty frame, letting the sequential/aggressive strategy
+        fail over to the next host instead of returning nothing.  The
+        previous implementation only checked this at the top of
+        ``query()``, long after the failover decision had already been
+        made, so the flag silently did nothing for multi-host routes.
 
         On auth failure the pool is evicted so the next credential creates a
         fresh pool with the new user/password.
@@ -837,10 +905,14 @@ class CadeKdbManager:
                 )
             try:
                 # Bound pool creation by the remaining query timeout so that
-                # a slow connect() can't silently blow the deadline.
-                conn_ms = min(
-                    self._connection_timeout_ms,
-                    max(int(remaining * 1000), 500),
+                # a slow connect() can't silently blow the deadline.  No
+                # artificial floor — if the caller has 100 ms of budget,
+                # we honour 100 ms rather than silently overshooting to
+                # 500 ms and leaking the failover deadline.  We clamp to
+                # >=1 ms only because ``q.Endpoint.tcp`` rejects zero.
+                conn_ms = max(
+                    1,
+                    min(self._connection_timeout_ms, int(remaining * 1000)),
                 )
                 client = await self.get_or_create(
                     hc.host,
@@ -852,6 +924,11 @@ class CadeKdbManager:
                     # Pass the remaining deadline budget so prewarm cannot
                     # silently exceed the caller's timeout.
                     connect_timeout=remaining,
+                    # Explicit no-auth attempt: bypass the default-cred
+                    # substitution inside ``get_or_create`` so the
+                    # handshake actually goes out credential-less against
+                    # gateways that reject any auth frame.
+                    allow_anonymous=(user is None and password is None),
                 )
                 # Recompute the deadline budget AFTER pool creation — a
                 # slow connect / prewarm / stale-close can consume most
@@ -872,7 +949,23 @@ class CadeKdbManager:
                     transform=transform,
                     decode=decode,
                 )
-                self._auth_cache.remember(hc.host, hc.port, user, password)
+                if empty_is_failure and isinstance(
+                    result, (pl.DataFrame, pl.LazyFrame)
+                ):
+                    if isinstance(result, pl.LazyFrame):
+                        # ``.limit(1).collect()`` is bounded at one row,
+                        # so a multi-GB lazy pipeline does not materialize
+                        # just to answer "is it empty".
+                        is_empty = result.limit(1).collect().is_empty()
+                    else:
+                        is_empty = result.is_empty()
+                    if is_empty:
+                        raise _EmptyResultError(
+                            f"Empty result from {hc.host}:{hc.port}"
+                        )
+                self._auth_cache.remember(
+                    hc.host, hc.port, user, password, hc.name
+                )
                 return result
             except asyncio.CancelledError:
                 raise
@@ -882,10 +975,15 @@ class CadeKdbManager:
             except (q.DecodeError, q.ProtocolError, q.OperationError, q.PoolError):
                 # Non-retriable qroissant errors — never rotate credentials.
                 raise
+            except _EmptyResultError:
+                # Propagate — failover happens in the outer strategy, not
+                # here (the current host WILL keep returning empty no
+                # matter which credential we try).
+                raise
             except Exception as e:
                 last_exc = e
                 if _is_auth_error(e):
-                    self._auth_cache.forget(hc.host, hc.port)
+                    self._auth_cache.forget(hc.host, hc.port, hc.name)
                     # Evict pool so next iteration creates one with new creds.
                     await self.remove_pool(hc.host, hc.port, hc.name)
                     continue
@@ -907,8 +1005,17 @@ class CadeKdbManager:
         output: Literal["polars", "arrow"],
         transform: CadeKdbTransformConfig | None,
         decode: q.DecodeOptions | None,
+        empty_is_failure: bool = False,
     ) -> Union[pl.LazyFrame, pl.DataFrame, q.Value]:
-        """Try hosts one-by-one until one succeeds.  Deadline-based budget."""
+        """Try hosts one-by-one until one succeeds.  Deadline-based budget.
+
+        Re-raises qroissant's non-retriable error classes
+        (``DecodeError``/``ProtocolError``/``OperationError``/``PoolError``)
+        without failover — ``_try_host`` deliberately re-raises those to
+        signal "this is a programming or protocol bug, not a host problem",
+        and a blanket ``except Exception: continue`` silently defeated that
+        contract and hid the root cause by retrying every host.
+        """
         deadline = time.monotonic() + timeout
         last_exc: BaseException | None = None
 
@@ -928,10 +1035,18 @@ class CadeKdbManager:
                     output=output,
                     transform=transform,
                     decode=decode,
+                    empty_is_failure=empty_is_failure,
                 )
             except asyncio.CancelledError:
                 raise
-            except q.QRuntimeError:
+            except (
+                q.QRuntimeError,
+                q.DecodeError,
+                q.ProtocolError,
+                q.OperationError,
+                q.PoolError,
+            ):
+                # Non-retriable — propagate without trying the next host.
                 raise
             except Exception as e:
                 last_exc = e
@@ -953,6 +1068,7 @@ class CadeKdbManager:
         output: Literal["polars", "arrow"],
         transform: CadeKdbTransformConfig | None,
         decode: q.DecodeOptions | None,
+        empty_is_failure: bool = False,
     ) -> Union[pl.LazyFrame, pl.DataFrame, q.Value]:
         """Race queries across all hosts.  First success wins, rest cancelled.
 
@@ -971,6 +1087,7 @@ class CadeKdbManager:
                     output=output,
                     transform=transform,
                     decode=decode,
+                    empty_is_failure=empty_is_failure,
                 ),
                 name=hc.key,
             )
@@ -994,6 +1111,19 @@ class CadeKdbManager:
             pending: set[asyncio.Task[Any]] = set(tasks)
             errors: dict[str, BaseException] = {}
 
+            # Non-retriable qroissant error classes.  Propagate the FIRST
+            # such failure without waiting for the rest of the fan-out —
+            # these indicate bugs (bad q, protocol mismatch, decode error)
+            # that every host will hit the same way, so racing is wasted
+            # work.
+            _non_retriable = (
+                q.QRuntimeError,
+                q.DecodeError,
+                q.ProtocolError,
+                q.OperationError,
+                q.PoolError,
+            )
+
             while pending:
                 done, pending = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
@@ -1006,7 +1136,7 @@ class CadeKdbManager:
                         continue
                     try:
                         result = t.result()
-                    except q.QRuntimeError:
+                    except _non_retriable:
                         for p in pending:
                             p.cancel()
                         if pending:
@@ -1041,6 +1171,22 @@ class CadeKdbManager:
                         return result
 
             if errors:
+                # Prefer the most informative failure.  Transport errors
+                # are noisy (connection refused / reset is the typical
+                # "this host is down" signal), so if any host produced a
+                # non-transport failure (auth, server error, timeout),
+                # surface that instead — it tells the caller WHY the
+                # fan-out failed rather than just reporting the first
+                # socket that dropped.  Empty-result failures are
+                # surfaced too so ``empty_is_failure`` gives a meaningful
+                # message.
+                non_transport = [
+                    e for e in errors.values()
+                    if not isinstance(e, asyncio.CancelledError)
+                    and not _is_transport_error(e)
+                ]
+                if non_transport:
+                    raise non_transport[0]
                 raise next(iter(errors.values()))
             raise RuntimeError("Aggressive fan-out: all hosts failed.")
 
@@ -1128,13 +1274,31 @@ class CadeKdbManager:
         output: Literal["polars", "arrow"],
         transform: CadeKdbTransformConfig | None,
         decode: q.DecodeOptions | None,
+        empty_is_failure: bool = False,
     ) -> Union[pl.LazyFrame, pl.DataFrame, q.Value]:
-        """Route *expr* through backdoor intermediary hosts."""
-        target_creds = _iter_credentials(
+        """Route *expr* through backdoor intermediary hosts.
+
+        The target credentials iterator skips the no-auth ``(None, None)``
+        fallback: the backdoor wire format embeds credentials literally in
+        a ``(`$":host:port:user:password")`` handle, which has no way to
+        express "no credentials".  Sending empty user/password would
+        produce ``:host:port::`` — the q parser treats the empty fields as
+        literal empty strings, not as "skip auth", so anonymous access
+        must go direct rather than via backdoor.
+        """
+        all_creds = _iter_credentials(
             HostConfig(host=target_host, port=target_port),
             self._auth_cache,
             effective_creds,
         )
+        target_creds = [
+            (u, p) for (u, p) in all_creds if u is not None and p is not None
+        ]
+        if not target_creds:
+            raise ConnectionError(
+                f"Backdoor requires credentials for {target_host}:{target_port}; "
+                f"none supplied."
+            )
 
         last_exc: BaseException | None = None
         for user, password in target_creds:
@@ -1150,6 +1314,7 @@ class CadeKdbManager:
                     output=output,
                     transform=transform,
                     decode=decode,
+                    empty_is_failure=empty_is_failure,
                 )
                 self._auth_cache.remember(
                     target_host, target_port, user, password
@@ -1157,7 +1322,13 @@ class CadeKdbManager:
                 return result
             except asyncio.CancelledError:
                 raise
-            except q.QRuntimeError:
+            except (
+                q.QRuntimeError,
+                q.DecodeError,
+                q.ProtocolError,
+                q.OperationError,
+                q.PoolError,
+            ):
                 raise
             except Exception as e:
                 last_exc = e
@@ -1291,24 +1462,33 @@ class CadeKdbManager:
             list(credentials) if credentials is not None else self._credentials
         )
 
-        result = await self._route(
-            expr,
-            host=host,
-            port=port,
-            hosts=hosts,
-            config=config,
-            name=name,
-            username=username,
-            password=password,
-            timeout=t,
-            aggressive=aggressive,
-            backdoor=backdoor,
-            backdoor_hosts=backdoor_hosts,
-            effective_creds=effective_creds,
-            output=output,
-            transform=transform,
-            decode=decode,
-        )
+        try:
+            result = await self._route(
+                expr,
+                host=host,
+                port=port,
+                hosts=hosts,
+                config=config,
+                name=name,
+                username=username,
+                password=password,
+                timeout=t,
+                aggressive=aggressive,
+                backdoor=backdoor,
+                backdoor_hosts=backdoor_hosts,
+                effective_creds=effective_creds,
+                output=output,
+                transform=transform,
+                decode=decode,
+                empty_is_failure=empty_is_failure,
+            )
+        except _EmptyResultError as e:
+            # Every host returned empty AND ``empty_is_failure=True``;
+            # translate the internal sentinel into the user-facing error
+            # documented on the public API.
+            raise RuntimeError(
+                f"Query returned empty result (empty_is_failure=True): {e}"
+            ) from None
 
         # -- post-result checks (backwards compat with old query_kdb) ------
         if none_is_failure and result is None:
@@ -1316,21 +1496,6 @@ class CadeKdbManager:
                 cfg = transform or self._default_transform
                 return pl.LazyFrame() if cfg.lazy else pl.DataFrame()
             raise RuntimeError("Query returned None (none_is_failure=True).")
-
-        if empty_is_failure and isinstance(result, (pl.DataFrame, pl.LazyFrame)):
-            if isinstance(result, pl.LazyFrame):
-                # Probe with .limit(1).collect() instead of materializing
-                # the whole lazy pipeline — a full .collect() just to check
-                # emptiness defeats the zero-copy lazy optimization and on
-                # multi-GB result sets causes OOM under concurrent queries.
-                probe = result.limit(1).collect()
-                is_empty = probe.is_empty()
-            else:
-                is_empty = result.is_empty()
-            if is_empty:
-                raise RuntimeError(
-                    "Query returned empty result (empty_is_failure=True)."
-                )
 
         return result
 
@@ -1353,6 +1518,7 @@ class CadeKdbManager:
         output: Literal["polars", "arrow"],
         transform: CadeKdbTransformConfig | None,
         decode: q.DecodeOptions | None,
+        empty_is_failure: bool = False,
     ) -> Union[pl.LazyFrame, pl.DataFrame, q.Value, None]:
         """Internal routing dispatch — separated from result checks."""
         host_list = _resolve_hosts(
@@ -1381,6 +1547,7 @@ class CadeKdbManager:
                 output=output,
                 transform=transform,
                 decode=decode,
+                empty_is_failure=empty_is_failure,
             )
 
         # Separate backdoor-flagged hosts (from config) from direct hosts.
@@ -1401,8 +1568,16 @@ class CadeKdbManager:
                     output=output,
                     transform=transform,
                     decode=decode,
+                    empty_is_failure=empty_is_failure,
                 )
-            except q.QRuntimeError:
+            except (
+                q.QRuntimeError,
+                q.DecodeError,
+                q.ProtocolError,
+                q.OperationError,
+                q.PoolError,
+            ):
+                # Non-retriable — propagate without backdoor fallback.
                 raise
             except Exception:
                 if not bd_flagged:
@@ -1427,6 +1602,7 @@ class CadeKdbManager:
                 output=output,
                 transform=transform,
                 decode=decode,
+                empty_is_failure=empty_is_failure,
             )
 
         raise RuntimeError("No hosts available.")
